@@ -1,0 +1,419 @@
+import open3d as o3d
+import numpy as np
+import os
+import glob
+from pathlib import Path
+import argparse
+from tqdm import tqdm
+import warnings
+
+
+def pointcloud_to_stl(
+    pointcloud_file_path,
+    output_path,
+    method='poisson',
+    depth=10,
+    width=0,
+    scale=1.1,
+    linear_fit=False,
+    density_quantile=0.01,
+    fill_holes=True,
+    remove_outliers=True,
+    nb_neighbors=30,
+    std_ratio=3.0,
+    cluster_cleanup=False,
+    cluster_eps_scale=1.5,
+    cluster_min_points=50,
+    planarize=False,
+    planarize_strength=1.0,
+    align_to_z=True,
+):
+    """
+    从点云文件重建STL网格并保存
+    
+    Args:
+        pointcloud_file_path (str): 点云文件路径（.npy格式）
+        output_path (str): 输出STL文件路径
+        method (str): 重建方法，'poisson' 或 'ball_pivoting'
+        depth (int): 八叉树深度，用于泊松重建；<=0 时自动估算
+        width (float): 球旋转半径，用于球旋转重建
+        scale (float): 泊松重建的尺度参数
+        linear_fit (bool): 是否使用线性拟合
+        density_quantile (float): 密度分位数阈值，用于移除噪声
+        fill_holes (bool): 是否填充网格孔洞
+    """
+    try:
+        # 始终使用CPU
+        pass
+        
+        # 加载点云数据
+        point_cloud_data = np.load(pointcloud_file_path)
+        
+        # 检查数据格式
+        if point_cloud_data.shape[1] == 6:
+            # 包含法向量的点云 (x, y, z, nx, ny, nz)
+            points = point_cloud_data[:, :3]
+            normals = point_cloud_data[:, 3:6]
+        elif point_cloud_data.shape[1] == 3:
+            # 只有坐标的点云 (x, y, z)
+            points = point_cloud_data
+            normals = None
+        else:
+            raise ValueError(f"不支持的点云格式，期望3或6列，实际{point_cloud_data.shape[1]}列")
+        
+        # 创建Open3D点云对象
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        
+        # 如果有法向量，直接使用；否则估算法向量
+        if normals is not None:
+            pcd.normals = o3d.utility.Vector3dVector(normals)
+        else:
+            # 使用KNN估算法向量（CPU）
+            pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=30))
+            pcd.normalize_normals()
+        
+        
+        
+        # 预处理：移除游离点 / 异常点
+        if remove_outliers:
+            try:
+                pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=nb_neighbors, std_ratio=std_ratio)
+                print(f"  已移除统计离群点 (nb_neighbors={nb_neighbors}, std_ratio={std_ratio})")
+            except Exception as e_rm:
+                warnings.warn(f"统计离群点移除失败: {e_rm}")
+
+        
+
+        # 预处理：基于聚类保留最大连通簇（默认关闭）
+        if cluster_cleanup and len(pcd.points) > 0:
+            try:
+                # 估计邻域尺度
+                nn_dists = pcd.compute_nearest_neighbor_distance()
+                mean_nn = float(np.mean(nn_dists)) if len(nn_dists) > 0 else 0.0
+                eps = mean_nn * cluster_eps_scale if mean_nn > 0 else 0.005
+                labels = np.array(pcd.cluster_dbscan(eps=eps, min_points=max(5, int(cluster_min_points))))
+                if labels.size > 0 and labels.max() >= 0:
+                    largest_label = int(np.bincount(labels[labels >= 0]).argmax())
+                    inliers = labels == largest_label
+                    pcd = pcd.select_by_index(np.where(inliers)[0])
+                    print(f"  已保留最大簇 (eps~{eps:.5f}, min_points={max(5, int(cluster_min_points))}) | 点数: {len(pcd.points)}")
+            except Exception as e_clu:
+                warnings.warn(f"DBSCAN聚类清理失败: {e_clu}")
+
+        # 预处理：平面化（默认关闭）
+        if planarize and len(pcd.points) > 0:
+            try:
+                pts_np = np.asarray(pcd.points)
+                centroid = pts_np.mean(axis=0)
+                # PCA法向
+                centered = pts_np - centroid
+                cov = centered.T @ centered / max(1, centered.shape[0] - 1)
+                evals, evecs = np.linalg.eigh(cov)
+                normal = evecs[:, np.argmin(evals)]
+                normal = normal / (np.linalg.norm(normal) + 1e-12)
+                # 投影到平面
+                if planarize_strength > 0:
+                    # 原始点到平面投影
+                    distances = (centered @ normal)
+                    proj = pts_np - np.outer(distances, normal)
+                    s = float(np.clip(planarize_strength, 0.0, 1.0))
+                    pts_np = (1.0 - s) * pts_np + s * proj
+                # 可选：将平面法向对齐到+Z，便于生成近似平面网格
+                if align_to_z:
+                    target = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+                    v = np.cross(normal, target)
+                    c = float(np.dot(normal, target))
+                    if np.linalg.norm(v) > 1e-12:
+                        vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]], dtype=np.float64)
+                        R = np.eye(3) + vx + (vx @ vx) * (1.0 / (1.0 + c + 1e-12))
+                        pts_np = (pts_np - centroid) @ R.T + centroid
+                pcd.points = o3d.utility.Vector3dVector(pts_np)
+                # 重新估算法向
+                pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=30))
+                pcd.normalize_normals()
+                print("  已执行平面化处理并对齐Z轴")
+            except Exception as e_pl:
+                warnings.warn(f"平面化处理失败: {e_pl}")
+
+        
+        # 根据选择的方法进行网格重建
+        if method.lower() == 'poisson':
+            mesh = reconstruct_poisson(
+                pcd,
+                depth,
+                width,
+                scale,
+                linear_fit,
+                density_quantile=density_quantile,
+                fill_holes=fill_holes,
+            )
+        elif method.lower() == 'ball_pivoting':
+            mesh = reconstruct_ball_pivoting(pcd, width)
+        elif method.lower() == 'alpha_shape':
+            # 将 width 解释为 alpha；若未提供则基于平均邻域估计
+            mesh = reconstruct_alpha_shape(pcd, alpha=width)
+        else:
+            raise ValueError(f"不支持的重建方法: {method}")
+        
+        # 保存为STL文件
+        success = o3d.io.write_triangle_mesh(output_path, mesh)
+        
+        if success:
+            print(f"成功重建: {pointcloud_file_path} -> {output_path}")
+            print(f"点云点数: {len(points)}")
+            print(f"重建网格 - 顶点数: {len(mesh.vertices)}, 面数: {len(mesh.triangles)}")
+            print("-" * 50)
+            return True
+        else:
+            print(f"保存STL文件失败: {output_path}")
+            return False
+            
+    except Exception as e:
+        print(f"处理文件 {pointcloud_file_path} 时出错: {str(e)}")
+        return False
+
+
+def reconstruct_poisson(pcd, depth=10, width=0, scale=1.1, linear_fit=False,
+                        density_quantile=0.01, fill_holes=True):
+    """
+    使用泊松重建方法重建网格
+    
+    Args:
+        pcd: Open3D点云对象
+        depth: 八叉树深度
+        width: 宽度参数
+        scale: 尺度参数
+        linear_fit: 是否使用线性拟合
+        density_quantile: 密度分位数阈值
+        fill_holes: 是否填充孔洞
+        device: 计算设备
+    
+    Returns:
+        Open3D网格对象
+    """
+    # 确保深度为有效值；取消自动估算，默认使用10
+    if depth is None or depth <= 0:
+        depth = 10
+
+    print(f"使用泊松重建 (深度={depth}, 尺度={scale})")
+
+    # 执行泊松重建
+    # 注意：Open3D的泊松重建在此仅使用CPU
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd, depth=depth, width=width, scale=scale, linear_fit=linear_fit
+    )
+    
+    # 计算法向量（保存STL需要）
+    mesh.compute_vertex_normals()
+    
+    # 根据密度移除噪声顶点（密度阈值用于去除重建的杂乱部分）
+    if density_quantile is not None and 0 < density_quantile < 1:
+        threshold = np.quantile(densities, density_quantile)
+        mesh.remove_vertices_by_mask(densities < threshold)
+
+    # 网格清理
+    mesh.remove_duplicated_vertices()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_degenerate_triangles()
+    mesh.remove_unreferenced_vertices()
+    mesh.remove_non_manifold_edges()
+
+    if fill_holes:
+        # Open3D >= 0.17 provides fill_holes; 若不可用则忽略
+        try:
+            mesh = mesh.fill_holes()
+        except AttributeError:
+            pass
+
+    return mesh
+
+
+def reconstruct_ball_pivoting(pcd, radius):
+    """
+    使用球旋转重建方法重建网格
+    
+    Args:
+        pcd: Open3D点云对象
+        radius: 球旋转半径
+        device: 计算设备
+    
+    Returns:
+        Open3D网格对象
+    """
+    print(f"使用球旋转重建 (半径={radius})")
+    
+    # 如果未指定半径，自动估算
+    if radius <= 0:
+        # 计算点云的平均距离作为半径
+        distances = pcd.compute_nearest_neighbor_distance()
+        radius = np.mean(distances) * 2
+    
+    # 执行球旋转重建
+    # 注意：球旋转重建目前主要在CPU上实现
+    mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+        pcd, o3d.utility.DoubleVector([radius, radius * 2, radius * 4])
+    )
+    
+    # 计算法向量（保存STL需要）
+    mesh.compute_vertex_normals()
+    
+    return mesh
+
+
+def reconstruct_alpha_shape(pcd, alpha: float = 0.0):
+    """
+    使用 Alpha Shape 从（近）平面点云重建网格。
+
+    当点云接近平面时，Alpha Shape 通常比泊松/球旋转更稳定。
+
+    Args:
+        pcd: Open3D 点云对象
+        alpha: Alpha 参数；<=0 时自动估算（基于平均最近邻距离）
+
+    Returns:
+        Open3D 网格对象
+    """
+    if alpha is None or alpha <= 0:
+        try:
+            dists = pcd.compute_nearest_neighbor_distance()
+            alpha = float(np.mean(dists)) * 2.0 if len(dists) > 0 else 0.01
+            print(f"  自动估算 alpha: {alpha:.6f}")
+        except Exception:
+            alpha = 0.01
+    mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd, alpha)
+    try:
+        mesh.compute_vertex_normals()
+    except Exception:
+        pass
+    # 清理
+    mesh.remove_duplicated_vertices()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_degenerate_triangles()
+    mesh.remove_unreferenced_vertices()
+    return mesh
+
+
+def process_directory(input_dir, output_dir, method='poisson', 
+                     depth=10, width=0, scale=1.1, linear_fit=False, device='CPU:0'):
+    """
+    处理目录中的所有点云文件
+    
+    Args:
+        input_dir (str): 输入目录路径
+        output_dir (str): 输出目录路径
+        method (str): 重建方法
+        depth (int): 八叉树深度
+        width (float): 球旋转半径
+        scale (float): 泊松重建尺度参数
+        linear_fit (bool): 是否使用线性拟合
+        device (str): 计算设备
+    """
+    # 创建输出目录
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 查找所有.npy点云文件
+    pointcloud_files = []
+    for file in os.listdir(input_dir):
+        if file.lower().endswith('.npy'):
+            pointcloud_files.append(os.path.join(input_dir, file))
+    
+    if not pointcloud_files:
+        print(f"在目录 {input_dir} 中未找到.npy文件")
+        return
+    
+    print(f"找到 {len(pointcloud_files)} 个点云文件")
+    
+    # 处理每个文件
+    success_count = 0
+    for pointcloud_file in tqdm(pointcloud_files, desc="处理点云文件"):
+        # 生成输出文件名
+        base_name = os.path.splitext(os.path.basename(pointcloud_file))[0]
+        output_file = os.path.join(output_dir, f"{base_name}.stl")
+        
+        # 重建STL
+        if pointcloud_to_stl(pointcloud_file, output_file, method, depth, width, scale, linear_fit):
+            success_count += 1
+    
+    print(f"\n处理完成: {success_count}/{len(pointcloud_files)} 个文件成功重建")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='从点云重建STL文件')
+    parser.add_argument('input', nargs='?', default='output/pointcloud/insoles',
+                       help='输入点云文件路径或目录 (默认: output/pointcloud/insoles)')
+    parser.add_argument('output', nargs='?', default='output/raw/insoles',
+                       help='输出STL文件路径或目录 (默认: output/raw/insoles)')
+    parser.add_argument('--method', choices=['poisson', 'ball_pivoting', 'alpha_shape'], 
+                       default='poisson', help='重建方法 (默认: poisson)')
+    parser.add_argument('--depth', type=int, default=10, 
+                       help='泊松重建的八叉树深度 (默认: 10)')
+    parser.add_argument('--width', type=float, default=0, 
+                       help='球旋转半径 (默认: 自动估算)')
+    parser.add_argument('--scale', type=float, default=1.1, 
+                       help='泊松重建尺度参数 (默认: 1.1)')
+    parser.add_argument('--linear-fit', action='store_true', 
+                       help='使用线性拟合 (泊松重建)')
+    # 仅保留离群点移除为默认流程；聚类清理和平面化默认关闭
+    parser.add_argument('--no-outlier-removal', action='store_true', help='禁用统计离群点移除')
+    parser.add_argument('--cluster-cleanup', action='store_true', help='启用基于聚类的游离点清理（默认关闭）')
+    parser.add_argument('--planarize', action='store_true', help='启用平面化处理（默认关闭）')
+    parser.add_argument('--planarize-strength', type=float, default=1.0, help='平面化强度[0,1]，1表示完全投影到平面')
+    parser.add_argument('--outlier-nb-neighbors', type=int, default=30, help='统计离群点移除的邻居数')
+    parser.add_argument('--outlier-std-ratio', type=float, default=3.0, help='统计离群点移除的标准差阈值')
+    # 兼容下方对 args.device 的引用（目前重建过程仅使用CPU，此参数仅为接口一致性）
+    parser.add_argument('--device', type=str, default='cpu', help='计算设备（当前未使用，仅为兼容接口）')
+    
+    args = parser.parse_args()
+    
+    # 检查输入路径
+    if not os.path.exists(args.input):
+        print(f"错误: 输入路径不存在: {args.input}")
+        return
+    
+    # 处理单个文件或目录
+    if os.path.isfile(args.input):
+        if not args.input.lower().endswith('.npy'):
+            print("错误: 输入文件必须是.npy格式")
+            return
+        
+        # 确保输出目录存在
+        output_dir = os.path.dirname(args.output)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        
+        pointcloud_to_stl(
+            args.input,
+            args.output,
+            args.method,
+            args.depth,
+            args.width,
+            args.scale,
+            args.linear_fit,
+            orient_normals=args.orient_normals,
+            orient_k=args.orient_k,
+            remove_outliers=not args.no_outlier_removal,
+            nb_neighbors=args.outlier_nb_neighbors,
+            std_ratio=args.outlier_std_ratio,
+            radius_removal=args.radius_removal,
+            radius=args.radius,
+            radius_nb_points=args.radius_nb_points,
+            cluster_cleanup=args.cluster_cleanup,
+            planarize=args.planarize,
+            planarize_strength=args.planarize_strength,
+            smooth_mesh=args.smooth_mesh,
+            smooth_method=args.smooth_method,
+            smooth_iterations=args.smooth_iterations,
+            smooth_lambda=args.smooth_lambda,
+        )
+    
+    elif os.path.isdir(args.input):
+        process_directory(args.input, args.output, args.method, 
+                         args.depth, args.width, args.scale, args.linear_fit, device=args.device)
+    
+    else:
+        print(f"错误: 无效的输入路径: {args.input}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,40 @@
+# Project-specific ignores
+.history/
+*.stl
+*.npy
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+.build/
+build/
+dist/
+.python-version
+
+# Environments
+.venv/
+venv/
+.env
+.env.*
+
+# Caches & logs
+.cache/
+pytest_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+*.log
+
+# Editors/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/

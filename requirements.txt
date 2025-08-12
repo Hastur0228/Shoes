@@ -1,0 +1,14 @@
+# Core
+numpy>=1.24
+scipy>=1.10
+
+# PyTorch (install CUDA-specific wheels as needed)
+torch>=2.1.0
+
+# Data & IO
+open3d>=0.17.0
+
+# Utils
+tqdm>=4.65
+
+
