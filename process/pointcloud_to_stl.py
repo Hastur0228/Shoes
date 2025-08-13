@@ -22,13 +22,13 @@ def pointcloud_to_stl(
     pointcloud_file_path,
     output_path,
     method='poisson',
-    depth=10,
+    depth=12,
     width=0,
     scale=1.1,
     linear_fit=False,
-    density_quantile=0.01,
+    density_quantile=0.0,
     fill_holes=True,
-    remove_outliers=True,
+    remove_outliers=False,
     nb_neighbors=30,
     std_ratio=3.0,
     radius_removal=False,
@@ -45,9 +45,9 @@ def pointcloud_to_stl(
     voxel_size=0.0,
     smooth_mesh=True,
     smooth_method='taubin',
-    smooth_iterations=10,
+    smooth_iterations=12,
     smooth_lambda=0.5,
-    keep_largest_component=True,
+    keep_largest_component=False,
     lcc_min_triangles=200,
     orient_triangles=True,
 ):
@@ -518,12 +518,12 @@ def main():
                        help='输出STL文件路径或目录 (默认: output/raw/insoles)')
     parser.add_argument('--method', choices=['auto', 'poisson', 'ball_pivoting', 'alpha_shape'], 
                        default='poisson', help='重建方法 (默认: poisson)')
-    parser.add_argument('--depth', type=int, default=10, 
-                       help='泊松重建的八叉树深度 (默认: 10)')
+    parser.add_argument('--depth', type=int, default=12, 
+                       help='泊松重建的八叉树深度 (默认: 12)')
     parser.add_argument('--width', type=float, default=0, 
-                       help='球旋转半径 / Alpha 值 (默认: 自动估算)')
+                         help='球旋转半径 / Alpha 值 (默认: 自动估算)')
     parser.add_argument('--scale', type=float, default=1.1, 
-                       help='泊松重建尺度参数 (默认: 1.1)')
+                        help='泊松重建尺度参数 (默认: 1.1)')
     parser.add_argument('--linear-fit', action='store_true', 
                        help='使用线性拟合 (泊松重建)')
 
@@ -551,7 +551,7 @@ def main():
     parser.set_defaults(align_to_z=True)
 
     # 泊松密度过滤与洞填补
-    parser.add_argument('--density-quantile', type=float, default=0.01, help='按密度分位数移除低密度区域')
+    parser.add_argument('--density-quantile', type=float, default=0.0, help='按密度分位数移除低密度区域（默认关闭）')
     parser.add_argument('--fill-holes', dest='fill_holes', action='store_true', help='填充孔洞（默认启用）')
     parser.add_argument('--no-fill-holes', dest='fill_holes', action='store_false', help='禁用孔洞填充')
     parser.set_defaults(fill_holes=True)
@@ -561,11 +561,11 @@ def main():
     parser.add_argument('--no-smooth-mesh', dest='smooth_mesh', action='store_false', help='禁用网格平滑')
     parser.set_defaults(smooth_mesh=True)
     parser.add_argument('--smooth-method', choices=['taubin', 'laplacian', 'simple'], default='taubin', help='平滑方法')
-    parser.add_argument('--smooth-iterations', type=int, default=10, help='平滑迭代次数')
+    parser.add_argument('--smooth-iterations', type=int, default=12, help='平滑迭代次数（默认 12）')
     parser.add_argument('--smooth-lambda', type=float, default=0.5, help='Laplacian 平滑的lambda因子（部分版本可能忽略）')
-    parser.add_argument('--keep-largest-component', dest='keep_largest_component', action='store_true', help='仅保留最大连通片（默认启用）')
+    parser.add_argument('--keep-largest-component', dest='keep_largest_component', action='store_true', help='仅保留最大连通片（默认关闭）')
     parser.add_argument('--no-keep-largest-component', dest='keep_largest_component', action='store_false', help='禁用仅保留最大连通片')
-    parser.set_defaults(keep_largest_component=True)
+    parser.set_defaults(keep_largest_component=False)
     parser.add_argument('--lcc-min-triangles', type=int, default=200, help='保留最大连通片时的最小三角形数阈值（参考）')
     parser.add_argument('--orient-triangles', dest='orient_triangles', action='store_true', help='统一三角形朝向')
     parser.add_argument('--no-orient-triangles', dest='orient_triangles', action='store_false', help='不统一三角形朝向')
