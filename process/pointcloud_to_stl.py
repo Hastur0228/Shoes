@@ -21,8 +21,9 @@ def pointcloud_to_stl(
     width=0,
     scale=1.1,
     linear_fit=False,
-    density_quantile=0.01,
+    density_quantile=0.005,
     fill_holes=True,
+    hole_ratio=0.02,
     remove_outliers=True,
     nb_neighbors=30,
     std_ratio=3.0,
@@ -167,6 +168,7 @@ def pointcloud_to_stl(
                 linear_fit,
                 density_quantile=density_quantile,
                 fill_holes=fill_holes,
+                hole_ratio=hole_ratio,
             )
         elif method.lower() == 'ball_pivoting':
             mesh = reconstruct_ball_pivoting(pcd, width)
@@ -176,26 +178,44 @@ def pointcloud_to_stl(
         else:
             raise ValueError(f"不支持的重建方法: {method}")
         
+        # 额外步骤：保留最大连通分量，去除孤立碎片
+        try:
+            labels = np.array(mesh.cluster_connected_triangles()[0])
+            if labels.size > 0:
+                largest_label = int(np.bincount(labels).argmax())
+                tri_mask_remove = labels != largest_label
+                mesh.remove_triangles_by_mask(tri_mask_remove)
+                mesh.remove_unreferenced_vertices()
+                print("  连通域: 保留最大连通分量")
+        except Exception as e:
+            warnings.warn(f"  连通域筛选失败: {e}")
+        
         # 再次尝试补洞（有些情况下第一次补洞后仍可能存在小孔洞）
         if fill_holes:
             try:
-                mesh = fill_mesh_holes_tensor(mesh)
+                mesh = fill_mesh_holes_tensor(mesh, hole_ratio=hole_ratio)
                 print("  二次补洞: 成功使用 tensor.fill_holes(hole_size=..) 并回写 legacy")
             except Exception as e:
                 warnings.warn(f"  二次补洞: 失败，原因: {e}")
 
-        # 平滑处理，减少噪声和锯齿
+        # 平滑处理，减少噪声和锯齿（优先使用非收缩 Taubin）
         try:
-            mesh = mesh.filter_smooth_simple(number_of_iterations=10)
+            smooth_method = None
+            if hasattr(mesh, "filter_smooth_taubin"):
+                mesh = mesh.filter_smooth_taubin(number_of_iterations=50)
+                smooth_method = "filter_smooth_taubin(iter=50)"
+            else:
+                mesh = mesh.filter_smooth_simple(number_of_iterations=10)
+                smooth_method = "filter_smooth_simple(iter=10)"
             # 平滑后需要重新计算法向
             try:
                 mesh.compute_vertex_normals()
             except Exception:
                 pass
-            print("  平滑: 成功使用 filter_smooth_simple(iter=10)")
+            print(f"  平滑: 成功使用 {smooth_method}")
         except AttributeError:
             # 旧版本 Open3D 无此API，忽略
-            print("  平滑: Open3D 版本不支持 filter_smooth_simple()，跳过")
+            print("  平滑: Open3D 版本不支持平滑API，跳过")
         except Exception as e:
             warnings.warn(f"  平滑: 失败，原因: {e}")
         
@@ -218,7 +238,7 @@ def pointcloud_to_stl(
 
 
 def reconstruct_poisson(pcd, depth=10, width=0, scale=1.1, linear_fit=False,
-                        density_quantile=0.01, fill_holes=True):
+                        density_quantile=0.005, fill_holes=True, hole_ratio: float = 0.02):
     """
     使用泊松重建方法重建网格
     
@@ -264,7 +284,7 @@ def reconstruct_poisson(pcd, depth=10, width=0, scale=1.1, linear_fit=False,
 
     if fill_holes:
         try:
-            mesh = fill_mesh_holes_tensor(mesh)
+            mesh = fill_mesh_holes_tensor(mesh, hole_ratio=hole_ratio)
             print("  首次补洞: 成功使用 tensor.fill_holes(hole_size=..) 并回写 legacy")
         except Exception as e:
             warnings.warn(f"  首次补洞: 失败，原因: {e}")
@@ -411,7 +431,10 @@ def fill_mesh_holes_tensor(mesh: o3d.geometry.TriangleMesh, hole_ratio: float = 
         return mesh
 
 def process_directory(input_dir, output_dir, method='poisson', 
-                     depth=10, width=0, scale=1.1, linear_fit=False, device='CPU:0'):
+                     depth=10, width=0, scale=1.1, linear_fit=False, device='CPU:0',
+                     hole_ratio: float = 0.02, density_quantile: float = 0.005, 
+                     remove_outliers: bool = True, nb_neighbors: int = 30, std_ratio: float = 3.0,
+                     cluster_cleanup: bool = False, planarize: bool = False, planarize_strength: float = 1.0):
     """
     处理目录中的所有点云文件
     
@@ -448,7 +471,10 @@ def process_directory(input_dir, output_dir, method='poisson',
         output_file = os.path.join(output_dir, f"{base_name}.stl")
         
         # 重建STL
-        if pointcloud_to_stl(pointcloud_file, output_file, method, depth, width, scale, linear_fit):
+        if pointcloud_to_stl(pointcloud_file, output_file, method, depth, width, scale, linear_fit,
+                              density_quantile=density_quantile, fill_holes=True, hole_ratio=hole_ratio,
+                              remove_outliers=remove_outliers, nb_neighbors=nb_neighbors, std_ratio=std_ratio,
+                              cluster_cleanup=cluster_cleanup, planarize=planarize, planarize_strength=planarize_strength):
             success_count += 1
     
     print(f"\n处理完成: {success_count}/{len(pointcloud_files)} 个文件成功重建")
@@ -465,18 +491,20 @@ def main():
     parser.add_argument('--depth', type=int, default=10, 
                        help='泊松重建的八叉树深度 (默认: 10)')
     parser.add_argument('--width', type=float, default=0, 
-                       help='球旋转半径 (默认: 自动估算)')
+                       help='球旋转半径 (默认: 自动估算) 或 alpha_shape 的 alpha 值')
     parser.add_argument('--scale', type=float, default=1.1, 
                        help='泊松重建尺度参数 (默认: 1.1)')
     parser.add_argument('--linear-fit', action='store_true', 
                        help='使用线性拟合 (泊松重建)')
+    parser.add_argument('--density-quantile', type=float, default=0.005, help='密度分位阈值（越小越完整，默认 0.005）')
+    parser.add_argument('--hole-ratio', type=float, default=0.02, help='按包围盒尺度的孔洞填充比例 (默认 0.02)')
     # 仅保留离群点移除为默认流程；聚类清理和平面化默认关闭
     parser.add_argument('--no-outlier-removal', action='store_true', help='禁用统计离群点移除')
+    parser.add_argument('--outlier-nb-neighbors', type=int, default=30, help='统计离群点移除的邻居数')
+    parser.add_argument('--outlier-std-ratio', type=float, default=3.0, help='统计离群点移除的标准差阈值')
     parser.add_argument('--cluster-cleanup', action='store_true', help='启用基于聚类的游离点清理（默认关闭）')
     parser.add_argument('--planarize', action='store_true', help='启用平面化处理（默认关闭）')
     parser.add_argument('--planarize-strength', type=float, default=1.0, help='平面化强度[0,1]，1表示完全投影到平面')
-    parser.add_argument('--outlier-nb-neighbors', type=int, default=30, help='统计离群点移除的邻居数')
-    parser.add_argument('--outlier-std-ratio', type=float, default=3.0, help='统计离群点移除的标准差阈值')
     # 兼容下方对 args.device 的引用（目前重建过程仅使用CPU，此参数仅为接口一致性）
     parser.add_argument('--device', type=str, default='cpu', help='计算设备（当前未使用，仅为兼容接口）')
     
@@ -506,26 +534,36 @@ def main():
             args.width,
             args.scale,
             args.linear_fit,
-            orient_normals=args.orient_normals,
-            orient_k=args.orient_k,
+            density_quantile=args.density_quantile,
+            fill_holes=True,
+            hole_ratio=args.hole_ratio,
             remove_outliers=not args.no_outlier_removal,
             nb_neighbors=args.outlier_nb_neighbors,
             std_ratio=args.outlier_std_ratio,
-            radius_removal=args.radius_removal,
-            radius=args.radius,
-            radius_nb_points=args.radius_nb_points,
             cluster_cleanup=args.cluster_cleanup,
             planarize=args.planarize,
             planarize_strength=args.planarize_strength,
-            smooth_mesh=args.smooth_mesh,
-            smooth_method=args.smooth_method,
-            smooth_iterations=args.smooth_iterations,
-            smooth_lambda=args.smooth_lambda,
         )
     
     elif os.path.isdir(args.input):
-        process_directory(args.input, args.output, args.method, 
-                         args.depth, args.width, args.scale, args.linear_fit, device=args.device)
+        process_directory(
+            args.input,
+            args.output,
+            args.method,
+            args.depth,
+            args.width,
+            args.scale,
+            args.linear_fit,
+            device=args.device,
+            hole_ratio=args.hole_ratio,
+            density_quantile=args.density_quantile,
+            remove_outliers=not args.no_outlier_removal,
+            nb_neighbors=args.outlier_nb_neighbors,
+            std_ratio=args.outlier_std_ratio,
+            cluster_cleanup=args.cluster_cleanup,
+            planarize=args.planarize,
+            planarize_strength=args.planarize_strength,
+        )
     
     else:
         print(f"错误: 无效的输入路径: {args.input}")
