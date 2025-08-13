@@ -6,6 +6,8 @@ from pathlib import Path
 import argparse
 from tqdm import tqdm
 import warnings
+import io
+from contextlib import redirect_stderr, redirect_stdout, nullcontext
 
 
 def _import_open3d():
@@ -50,6 +52,7 @@ def pointcloud_to_stl(
     keep_largest_component=False,
     lcc_min_triangles=200,
     orient_triangles=True,
+    suppress_native_warnings=False,
 ):
     """
     从点云文件重建STL网格并保存
@@ -214,6 +217,7 @@ def pointcloud_to_stl(
                 linear_fit,
                 density_quantile=density_quantile,
                 fill_holes=fill_holes,
+                suppress_native_warnings=suppress_native_warnings,
             )
         elif method_lower == 'ball_pivoting':
             mesh = reconstruct_ball_pivoting(pcd, width)
@@ -255,7 +259,7 @@ def pointcloud_to_stl(
 
 
 def reconstruct_poisson(pcd, depth=10, width=0, scale=1.1, linear_fit=False,
-                        density_quantile=0.01, fill_holes=True):
+                        density_quantile=0.01, fill_holes=True, suppress_native_warnings: bool = False):
     """
     使用泊松重建方法重建网格
     
@@ -281,9 +285,29 @@ def reconstruct_poisson(pcd, depth=10, width=0, scale=1.1, linear_fit=False,
     # 执行泊松重建
     # 注意：Open3D的泊松重建在此仅使用CPU
     o3d = _import_open3d()
-    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-        pcd, depth=depth, width=width, scale=scale, linear_fit=linear_fit
-    )
+    # 可选：捕获底层 PoissonRecon 的控制台输出（bad average roots 等），减少噪声
+    capture_stream = io.StringIO()
+    ctx = (redirect_stderr(capture_stream), redirect_stdout(capture_stream)) if suppress_native_warnings else (nullcontext(), nullcontext())
+    # 同时降低 Open3D 的日志级别到 Error（若可用）
+    prev_level = None
+    if suppress_native_warnings:
+        try:
+            prev_level = o3d.utility.get_verbosity_level()
+            o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
+        except Exception:
+            prev_level = None
+    try:
+        with ctx[0]:
+            with ctx[1]:
+                mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+                    pcd, depth=depth, width=width, scale=scale, linear_fit=linear_fit
+                )
+    finally:
+        if suppress_native_warnings and prev_level is not None:
+            try:
+                o3d.utility.set_verbosity_level(prev_level)
+            except Exception:
+                pass
     
     # 计算法向量（保存STL需要）
     mesh.compute_vertex_normals()
@@ -570,6 +594,9 @@ def main():
     parser.add_argument('--orient-triangles', dest='orient_triangles', action='store_true', help='统一三角形朝向')
     parser.add_argument('--no-orient-triangles', dest='orient_triangles', action='store_false', help='不统一三角形朝向')
     parser.set_defaults(orient_triangles=True)
+    parser.add_argument('--suppress-native-warnings', dest='suppress_native_warnings', action='store_true', help='尽量捕获底层 PoissonRecon 的控制台警告')
+    parser.add_argument('--no-suppress-native-warnings', dest='suppress_native_warnings', action='store_false', help='不捕获底层 PoissonRecon 控制台输出')
+    parser.set_defaults(suppress_native_warnings=False)
 
     # 兼容下方对 args.device 的引用（目前重建过程仅使用CPU，此参数仅为接口一致性）
     parser.add_argument('--device', type=str, default='cpu', help='计算设备（当前未使用，仅为兼容接口）')
@@ -612,6 +639,7 @@ def main():
         keep_largest_component=args.keep_largest_component,
         lcc_min_triangles=args.lcc_min_triangles,
         orient_triangles=args.orient_triangles,
+        suppress_native_warnings=args.suppress_native_warnings,
     )
     
     # 处理单个文件或目录
