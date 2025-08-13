@@ -6,11 +6,48 @@ from pathlib import Path
 import argparse
 from tqdm import tqdm
 import warnings
+import logging
+from typing import Optional, Tuple, Dict, Any, List
+import time
+import csv
 try:
     import pymeshfix  # type: ignore
     _HAS_PYMESHFIX = True
 except Exception:
     _HAS_PYMESHFIX = False
+
+
+class TqdmLoggingHandler(logging.Handler):
+    """A logging handler that writes messages using tqdm.write to avoid breaking progress bars."""
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            tqdm.write(msg)
+        except Exception:
+            pass
+
+
+def setup_logger(log_file: Optional[str] = None, level: str = "INFO") -> logging.Logger:
+    logger = logging.getLogger("pointcloud_to_stl")
+    logger.setLevel(getattr(logging, str(level).upper(), logging.INFO))
+    # Clear existing handlers
+    while logger.handlers:
+        logger.removeHandler(logger.handlers[0])
+    fmt = logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    sh = TqdmLoggingHandler()
+    sh.setLevel(logger.level)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    if log_file:
+        os.makedirs(os.path.dirname(log_file) or '.', exist_ok=True)
+        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh.setLevel(logger.level)
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    return logger
+
+
+logger = logging.getLogger("pointcloud_to_stl")
 
 
 def pointcloud_to_stl(
@@ -33,6 +70,7 @@ def pointcloud_to_stl(
     planarize=False,
     planarize_strength=1.0,
     align_to_z=True,
+    collect_stats: bool = False,
 ):
     """
     从点云文件重建STL网格并保存
@@ -48,6 +86,21 @@ def pointcloud_to_stl(
         density_quantile (float): 密度分位数阈值，用于移除噪声
         fill_holes (bool): 是否填充网格孔洞
     """
+    start_time = time.perf_counter()
+    stats: Dict[str, Any] = {
+        "input": pointcloud_file_path,
+        "output": output_path,
+        "method": method,
+        "depth": depth,
+        "width_or_alpha": width,
+        "scale": scale,
+        "linear_fit": bool(linear_fit),
+        "density_quantile": float(density_quantile) if density_quantile is not None else None,
+        "hole_ratio": float(hole_ratio),
+        "cluster_cleanup": bool(cluster_cleanup),
+        "planarize": bool(planarize),
+        "planarize_strength": float(planarize_strength),
+    }
     try:
         # 始终使用CPU
         pass
@@ -66,6 +119,7 @@ def pointcloud_to_stl(
             normals = None
         else:
             raise ValueError(f"不支持的点云格式，期望3或6列，实际{point_cloud_data.shape[1]}列")
+        stats["num_input_points"] = int(points.shape[0])
         
         # 创建Open3D点云对象
         pcd = o3d.geometry.PointCloud()
@@ -92,7 +146,7 @@ def pointcloud_to_stl(
         if remove_outliers:
             try:
                 pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=nb_neighbors, std_ratio=std_ratio)
-                print(f"  已移除统计离群点 (nb_neighbors={nb_neighbors}, std_ratio={std_ratio})")
+                logger.info(f"已移除统计离群点 (nb_neighbors={nb_neighbors}, std_ratio={std_ratio})")
             except Exception as e_rm:
                 warnings.warn(f"统计离群点移除失败: {e_rm}")
 
@@ -111,7 +165,7 @@ def pointcloud_to_stl(
                     largest_label = int(np.bincount(labels[labels >= 0]).argmax())
                     inliers = labels == largest_label
                     pcd = pcd.select_by_index(np.where(inliers)[0])
-                    print(f"  已保留最大簇 (eps~{eps:.5f}, min_points={max(5, int(cluster_min_points))}) | 点数: {len(pcd.points)}")
+                    logger.info(f"已保留最大簇 (eps~{eps:.5f}, min_points={max(5, int(cluster_min_points))}) | 点数: {len(pcd.points)}")
             except Exception as e_clu:
                 warnings.warn(f"DBSCAN聚类清理失败: {e_clu}")
 
@@ -153,11 +207,10 @@ def pointcloud_to_stl(
                 except Exception:
                     pass
                 pcd.normalize_normals()
-                print("  已执行平面化处理并对齐Z轴")
+                logger.info("已执行平面化处理并对齐Z轴")
             except Exception as e_pl:
                 warnings.warn(f"平面化处理失败: {e_pl}")
 
-        
         # 根据选择的方法进行网格重建
         if method.lower() == 'poisson':
             mesh = reconstruct_poisson(
@@ -186,7 +239,7 @@ def pointcloud_to_stl(
                 tri_mask_remove = labels != largest_label
                 mesh.remove_triangles_by_mask(tri_mask_remove)
                 mesh.remove_unreferenced_vertices()
-                print("  连通域: 保留最大连通分量")
+                logger.info("连通域: 保留最大连通分量")
         except Exception as e:
             warnings.warn(f"  连通域筛选失败: {e}")
         
@@ -194,7 +247,7 @@ def pointcloud_to_stl(
         if fill_holes:
             try:
                 mesh = fill_mesh_holes_tensor(mesh, hole_ratio=hole_ratio)
-                print("  二次补洞: 成功使用 tensor.fill_holes(hole_size=..) 并回写 legacy")
+                logger.info("二次补洞: 成功使用 tensor.fill_holes(hole_size=..) 并回写 legacy")
             except Exception as e:
                 warnings.warn(f"  二次补洞: 失败，原因: {e}")
 
@@ -212,28 +265,42 @@ def pointcloud_to_stl(
                 mesh.compute_vertex_normals()
             except Exception:
                 pass
-            print(f"  平滑: 成功使用 {smooth_method}")
+            logger.info(f"平滑: 成功使用 {smooth_method}")
         except AttributeError:
             # 旧版本 Open3D 无此API，忽略
-            print("  平滑: Open3D 版本不支持平滑API，跳过")
+            logger.info("平滑: Open3D 版本不支持平滑API，跳过")
         except Exception as e:
             warnings.warn(f"  平滑: 失败，原因: {e}")
         
         # 保存为STL文件
         success = o3d.io.write_triangle_mesh(output_path, mesh)
         
+        elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+        stats["elapsed_ms"] = elapsed_ms
+        
         if success:
-            print(f"成功重建: {pointcloud_file_path} -> {output_path}")
-            print(f"点云点数: {len(points)}")
-            print(f"重建网格 - 顶点数: {len(mesh.vertices)}, 面数: {len(mesh.triangles)}")
-            print("-" * 50)
+            logger.info(f"成功重建: {pointcloud_file_path} -> {output_path}")
+            logger.info(f"点云点数: {len(points)} | 重建网格: 顶点 {len(mesh.vertices)} 面 {len(mesh.triangles)} | 用时 {elapsed_ms} ms")
+            stats.update({
+                "success": True,
+                "num_vertices": int(len(mesh.vertices)),
+                "num_triangles": int(len(mesh.triangles)),
+            })
+            if collect_stats:
+                return True, stats
             return True
         else:
-            print(f"保存STL文件失败: {output_path}")
+            logger.error(f"保存STL文件失败: {output_path}")
+            stats.update({"success": False, "error": "write_triangle_mesh failed"})
+            if collect_stats:
+                return False, stats
             return False
             
     except Exception as e:
-        print(f"处理文件 {pointcloud_file_path} 时出错: {str(e)}")
+        logger.error(f"处理文件 {pointcloud_file_path} 时出错: {str(e)}")
+        stats.update({"success": False, "error": str(e)})
+        if collect_stats:
+            return False, stats
         return False
 
 
@@ -259,7 +326,7 @@ def reconstruct_poisson(pcd, depth=10, width=0, scale=1.1, linear_fit=False,
     if depth is None or depth <= 0:
         depth = 10
 
-    print(f"使用泊松重建 (深度={depth}, 尺度={scale})")
+    logger.info(f"使用泊松重建 (深度={depth}, 尺度={scale})")
 
     # 执行泊松重建
     # 注意：Open3D的泊松重建在此仅使用CPU
@@ -285,7 +352,7 @@ def reconstruct_poisson(pcd, depth=10, width=0, scale=1.1, linear_fit=False,
     if fill_holes:
         try:
             mesh = fill_mesh_holes_tensor(mesh, hole_ratio=hole_ratio)
-            print("  首次补洞: 成功使用 tensor.fill_holes(hole_size=..) 并回写 legacy")
+            logger.info("首次补洞: 成功使用 tensor.fill_holes(hole_size=..) 并回写 legacy")
         except Exception as e:
             warnings.warn(f"  首次补洞: 失败，原因: {e}")
 
@@ -304,7 +371,7 @@ def reconstruct_ball_pivoting(pcd, radius):
     Returns:
         Open3D网格对象
     """
-    print(f"使用球旋转重建 (半径={radius})")
+    logger.info(f"使用球旋转重建 (半径={radius})")
     
     # 如果未指定半径，自动估算
     if radius <= 0:
@@ -341,7 +408,7 @@ def reconstruct_alpha_shape(pcd, alpha: float = 0.0):
         try:
             dists = pcd.compute_nearest_neighbor_distance()
             alpha = float(np.mean(dists)) * 2.0 if len(dists) > 0 else 0.01
-            print(f"  自动估算 alpha: {alpha:.6f}")
+            logger.info(f"自动估算 alpha: {alpha:.6f}")
         except Exception:
             alpha = 0.01
     mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd, alpha)
@@ -434,7 +501,8 @@ def process_directory(input_dir, output_dir, method='poisson',
                      depth=10, width=0, scale=1.1, linear_fit=False, device='CPU:0',
                      hole_ratio: float = 0.02, density_quantile: float = 0.005, 
                      remove_outliers: bool = True, nb_neighbors: int = 30, std_ratio: float = 3.0,
-                     cluster_cleanup: bool = False, planarize: bool = False, planarize_strength: float = 1.0):
+                     cluster_cleanup: bool = False, planarize: bool = False, planarize_strength: float = 1.0,
+                     summary_csv: Optional[str] = None) -> None:
     """
     处理目录中的所有点云文件
     
@@ -450,34 +518,57 @@ def process_directory(input_dir, output_dir, method='poisson',
     """
     # 创建输出目录
     os.makedirs(output_dir, exist_ok=True)
+    if summary_csv is None:
+        summary_csv = os.path.join(output_dir, "reconstruction_summary.csv")
     
     # 查找所有.npy点云文件
-    pointcloud_files = []
+    pointcloud_files: List[str] = []
     for file in os.listdir(input_dir):
         if file.lower().endswith('.npy'):
             pointcloud_files.append(os.path.join(input_dir, file))
     
     if not pointcloud_files:
-        print(f"在目录 {input_dir} 中未找到.npy文件")
+        logger.warning(f"在目录 {input_dir} 中未找到.npy文件")
         return
     
-    print(f"找到 {len(pointcloud_files)} 个点云文件")
+    logger.info(f"找到 {len(pointcloud_files)} 个点云文件")
     
     # 处理每个文件
     success_count = 0
+    rows: List[Dict[str, Any]] = []
     for pointcloud_file in tqdm(pointcloud_files, desc="处理点云文件"):
         # 生成输出文件名
         base_name = os.path.splitext(os.path.basename(pointcloud_file))[0]
         output_file = os.path.join(output_dir, f"{base_name}.stl")
         
-        # 重建STL
-        if pointcloud_to_stl(pointcloud_file, output_file, method, depth, width, scale, linear_fit,
+        # 重建STL（收集统计信息）
+        success, stats = pointcloud_to_stl(pointcloud_file, output_file, method, depth, width, scale, linear_fit,
                               density_quantile=density_quantile, fill_holes=True, hole_ratio=hole_ratio,
                               remove_outliers=remove_outliers, nb_neighbors=nb_neighbors, std_ratio=std_ratio,
-                              cluster_cleanup=cluster_cleanup, planarize=planarize, planarize_strength=planarize_strength):
+                              cluster_cleanup=cluster_cleanup, planarize=planarize, planarize_strength=planarize_strength,
+                              collect_stats=True)
+        rows.append(stats)
+        if success:
             success_count += 1
     
-    print(f"\n处理完成: {success_count}/{len(pointcloud_files)} 个文件成功重建")
+    # 写入汇总 CSV
+    try:
+        header = [
+            "input", "output", "success", "error",
+            "num_input_points", "num_vertices", "num_triangles", "elapsed_ms",
+            "method", "depth", "width_or_alpha", "scale", "linear_fit",
+            "density_quantile", "hole_ratio", "cluster_cleanup", "planarize", "planarize_strength",
+        ]
+        with open(summary_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=header)
+            writer.writeheader()
+            for r in rows:
+                writer.writerow({k: r.get(k, None) for k in header})
+        logger.info(f"汇总已写入: {summary_csv}")
+    except Exception as e:
+        warnings.warn(f"写入汇总CSV失败: {e}")
+    
+    logger.info(f"处理完成: {success_count}/{len(pointcloud_files)} 个文件成功重建")
 
 
 def main():
@@ -505,20 +596,27 @@ def main():
     parser.add_argument('--cluster-cleanup', action='store_true', help='启用基于聚类的游离点清理（默认关闭）')
     parser.add_argument('--planarize', action='store_true', help='启用平面化处理（默认关闭）')
     parser.add_argument('--planarize-strength', type=float, default=1.0, help='平面化强度[0,1]，1表示完全投影到平面')
-    # 兼容下方对 args.device 的引用（目前重建过程仅使用CPU，此参数仅为接口一致性）
+    # 兼容下方对 args.device 的引用（目前重建过程仅使用CPU，此参数仅为兼容接口）
     parser.add_argument('--device', type=str, default='cpu', help='计算设备（当前未使用，仅为兼容接口）')
+    # 日志与汇总
+    parser.add_argument('--log-file', type=str, default=None, help='日志文件路径（可选，若提供会同时写入文件）')
+    parser.add_argument('--log-level', type=str, default='INFO', choices=['DEBUG','INFO','WARNING','ERROR'], help='日志级别')
+    parser.add_argument('--summary-csv', type=str, default=None, help='目录模式下的汇总CSV路径（默认写入到输出目录）')
     
     args = parser.parse_args()
+
+    # 初始化日志
+    setup_logger(args.log_file, args.log_level)
     
     # 检查输入路径
     if not os.path.exists(args.input):
-        print(f"错误: 输入路径不存在: {args.input}")
+        logger.error(f"输入路径不存在: {args.input}")
         return
     
     # 处理单个文件或目录
     if os.path.isfile(args.input):
         if not args.input.lower().endswith('.npy'):
-            print("错误: 输入文件必须是.npy格式")
+            logger.error("输入文件必须是.npy格式")
             return
         
         # 确保输出目录存在
@@ -563,10 +661,11 @@ def main():
             cluster_cleanup=args.cluster_cleanup,
             planarize=args.planarize,
             planarize_strength=args.planarize_strength,
+            summary_csv=args.summary_csv,
         )
     
     else:
-        print(f"错误: 无效的输入路径: {args.input}")
+        logger.error(f"无效的输入路径: {args.input}")
 
 
 if __name__ == "__main__":
