@@ -10,11 +10,57 @@ from typing import Tuple
 from scipy.interpolate import Rbf
 from scipy.spatial import cKDTree
 from scipy import ndimage
+import sys
+import logging
+from datetime import datetime
+import time
 try:
     import pymeshfix  # type: ignore
     _HAS_PYMESHFIX = True
 except Exception:
     _HAS_PYMESHFIX = False
+
+class _Tee:
+    def __init__(self, stream_a, stream_b):
+        self.stream_a = stream_a
+        self.stream_b = stream_b
+    def write(self, data):
+        try:
+            self.stream_a.write(data)
+        except Exception:
+            pass
+        try:
+            self.stream_b.write(data)
+        except Exception:
+            pass
+    def flush(self):
+        try:
+            self.stream_a.flush()
+        except Exception:
+            pass
+        try:
+            self.stream_b.flush()
+        except Exception:
+            pass
+
+def setup_run_logging(log_dir: str | None = None, log_file: str | None = None) -> str:
+    """Set up tee logging to both console and a file. Returns the log file path."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if log_file:
+        log_path = os.path.abspath(log_file)
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    else:
+        base_dir = os.path.abspath(log_dir or "logs")
+        os.makedirs(base_dir, exist_ok=True)
+        log_path = os.path.join(base_dir, f"pointcloud_to_stl_{ts}.log")
+    # Basic logging for external consumers
+    logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+    # Tee stdout/stderr
+    fh = open(log_path, 'a', buffering=1)
+    sys.stdout = _Tee(sys.stdout, fh)
+    sys.stderr = _Tee(sys.stderr, fh)
+    print(f"[LOG] 日志写入: {log_path}")
+    return log_path
 
 def _align_plane_to_z_inplace(pcd: o3d.geometry.PointCloud) -> None:
     """
@@ -742,12 +788,14 @@ def process_directory(
     
     # 处理每个文件
     success_count = 0
+    t0 = time.time()
     for pointcloud_file in tqdm(pointcloud_files, desc="处理点云文件"):
         # 生成输出文件名
         base_name = os.path.splitext(os.path.basename(pointcloud_file))[0]
         output_file = os.path.join(output_dir, f"{base_name}.stl")
         
         # 重建STL
+        t_file = time.time()
         if pointcloud_to_stl(
             pointcloud_file,
             output_file,
@@ -786,8 +834,10 @@ def process_directory(
             hf_max_samples,
         ):
             success_count += 1
+        dt = time.time() - t_file
+        print(f"  完成: {base_name}.npy -> {base_name}.stl | 用时 {dt:.2f}s")
     
-    print(f"\n处理完成: {success_count}/{len(pointcloud_files)} 个文件成功重建")
+    print(f"\n处理完成: {success_count}/{len(pointcloud_files)} 个文件成功重建 | 总用时 {time.time()-t0:.2f}s")
 
 
 def main():
@@ -840,8 +890,16 @@ def main():
     parser.add_argument('--hf-mask-dilate-iters', type=int, default=1, help='轮廓膨胀迭代次数')
     parser.add_argument('--hf-mask-close-size', type=int, default=3, help='轮廓闭运算窗口（像素）')
     parser.add_argument('--hf-max-samples', type=int, default=20000, help='RBF 最大采样点数（加速）')
+    # Logging options
+    parser.add_argument('--log-file', type=str, default='', help='日志文件路径（优先级最高）')
+    parser.add_argument('--log-dir', type=str, default='logs', help='日志目录（未指定 log-file 时生效）')
 
     args = parser.parse_args()
+    # Setup logging (tee to file)
+    log_path = setup_run_logging(log_dir=(args.log_dir or 'logs'), log_file=(args.log_file or None))
+    print("运行参数:")
+    for k, v in sorted(vars(args).items()):
+        print(f"  - {k}: {v}")
     
     # 检查输入路径
     if not os.path.exists(args.input):
