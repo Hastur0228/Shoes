@@ -6,6 +6,11 @@ from pathlib import Path
 import argparse
 from tqdm import tqdm
 import warnings
+try:
+    import pymeshfix  # type: ignore
+    _HAS_PYMESHFIX = True
+except Exception:
+    _HAS_PYMESHFIX = False
 
 
 def pointcloud_to_stl(
@@ -64,17 +69,24 @@ def pointcloud_to_stl(
         # 创建Open3D点云对象
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points)
-        
+
         # 如果有法向量，直接使用；否则估算法向量
         if normals is not None:
             pcd.normals = o3d.utility.Vector3dVector(normals)
         else:
-            # 使用KNN估算法向量（CPU）
-            pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=30))
+            # 使用 Hybrid 半径+邻居 数的法向估计，并统一朝向与归一化
+            try:
+                pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=3.0, max_nn=30))
+            except Exception:
+                pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=30))
+            try:
+                pcd.orient_normals_consistent_tangent_plane(k=10)
+            except Exception:
+                pass
             pcd.normalize_normals()
-        
-        
-        
+
+
+
         # 预处理：移除游离点 / 异常点
         if remove_outliers:
             try:
@@ -82,6 +94,7 @@ def pointcloud_to_stl(
                 print(f"  已移除统计离群点 (nb_neighbors={nb_neighbors}, std_ratio={std_ratio})")
             except Exception as e_rm:
                 warnings.warn(f"统计离群点移除失败: {e_rm}")
+
 
         
 
@@ -129,8 +142,15 @@ def pointcloud_to_stl(
                         R = np.eye(3) + vx + (vx @ vx) * (1.0 / (1.0 + c + 1e-12))
                         pts_np = (pts_np - centroid) @ R.T + centroid
                 pcd.points = o3d.utility.Vector3dVector(pts_np)
-                # 重新估算法向
-                pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=30))
+                # 重新估算法向（Hybrid），统一朝向并归一化
+                try:
+                    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=3.0, max_nn=30))
+                except Exception:
+                    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=30))
+                try:
+                    pcd.orient_normals_consistent_tangent_plane(k=10)
+                except Exception:
+                    pass
                 pcd.normalize_normals()
                 print("  已执行平面化处理并对齐Z轴")
             except Exception as e_pl:
@@ -155,6 +175,29 @@ def pointcloud_to_stl(
             mesh = reconstruct_alpha_shape(pcd, alpha=width)
         else:
             raise ValueError(f"不支持的重建方法: {method}")
+        
+        # 再次尝试补洞（有些情况下第一次补洞后仍可能存在小孔洞）
+        if fill_holes:
+            try:
+                mesh = fill_mesh_holes_tensor(mesh)
+                print("  二次补洞: 成功使用 tensor.fill_holes(hole_size=..) 并回写 legacy")
+            except Exception as e:
+                warnings.warn(f"  二次补洞: 失败，原因: {e}")
+
+        # 平滑处理，减少噪声和锯齿
+        try:
+            mesh = mesh.filter_smooth_simple(number_of_iterations=10)
+            # 平滑后需要重新计算法向
+            try:
+                mesh.compute_vertex_normals()
+            except Exception:
+                pass
+            print("  平滑: 成功使用 filter_smooth_simple(iter=10)")
+        except AttributeError:
+            # 旧版本 Open3D 无此API，忽略
+            print("  平滑: Open3D 版本不支持 filter_smooth_simple()，跳过")
+        except Exception as e:
+            warnings.warn(f"  平滑: 失败，原因: {e}")
         
         # 保存为STL文件
         success = o3d.io.write_triangle_mesh(output_path, mesh)
@@ -220,11 +263,11 @@ def reconstruct_poisson(pcd, depth=10, width=0, scale=1.1, linear_fit=False,
     mesh.remove_non_manifold_edges()
 
     if fill_holes:
-        # Open3D >= 0.17 provides fill_holes; 若不可用则忽略
         try:
-            mesh = mesh.fill_holes()
-        except AttributeError:
-            pass
+            mesh = fill_mesh_holes_tensor(mesh)
+            print("  首次补洞: 成功使用 tensor.fill_holes(hole_size=..) 并回写 legacy")
+        except Exception as e:
+            warnings.warn(f"  首次补洞: 失败，原因: {e}")
 
     return mesh
 
@@ -293,6 +336,79 @@ def reconstruct_alpha_shape(pcd, alpha: float = 0.0):
     mesh.remove_unreferenced_vertices()
     return mesh
 
+
+def fill_mesh_holes_tensor(mesh: o3d.geometry.TriangleMesh, hole_ratio: float = 0.02,
+                           enable_meshfix: bool = True) -> o3d.geometry.TriangleMesh:
+    """
+    使用张量API按给定比例估计 hole_size 并填充孔洞。
+
+    流程：
+    - 清理重复与无引用元素
+    - 非流形检测，若允许且可用则用 pymeshfix 修复
+    - 计算包围盒尺度估计 hole_size
+    - 转 tensor mesh，执行 fill_holes(hole_size=..)，再转回 legacy
+    - 重算法向
+    """
+    if mesh is None:
+        return mesh
+
+    # 预清理
+    try:
+        mesh.remove_duplicated_vertices()
+        mesh.remove_duplicated_triangles()
+        mesh.remove_unreferenced_vertices()
+        mesh.remove_degenerate_triangles()
+    except Exception:
+        pass
+
+    # 非流形修复（可选）
+    try:
+        is_edge_manifold = mesh.is_edge_manifold()
+        is_vertex_manifold = mesh.is_vertex_manifold()
+    except Exception:
+        is_edge_manifold = True
+        is_vertex_manifold = True
+
+    if enable_meshfix and _HAS_PYMESHFIX and not (is_edge_manifold and is_vertex_manifold):
+        try:
+            vertices_np = np.asarray(mesh.vertices)
+            triangles_np = np.asarray(mesh.triangles)
+            fixer = pymeshfix.MeshFix(vertices_np, triangles_np)
+            fixer.repair()
+            repaired_vertices = fixer.mesh.vertices
+            repaired_faces = fixer.mesh.faces
+            mesh = o3d.geometry.TriangleMesh(
+                o3d.utility.Vector3dVector(repaired_vertices),
+                o3d.utility.Vector3iVector(repaired_faces),
+            )
+        except Exception as e:
+            warnings.warn(f"pymeshfix 修复失败，继续执行填洞: {e}")
+
+    # 估算 hole_size
+    try:
+        bbox_extent = mesh.get_max_bound() - mesh.get_min_bound()
+        bbox_extent = np.asarray(bbox_extent, dtype=float)
+        bbox_norm = float(np.linalg.norm(bbox_extent))
+        hole_size = bbox_norm * float(hole_ratio)
+        if not np.isfinite(hole_size) or hole_size <= 0:
+            hole_size = max(1e-6, bbox_norm * 0.01)
+    except Exception:
+        hole_size = 1e-3
+
+    # 张量填洞
+    try:
+        mesh_tensor = o3d.t.geometry.TriangleMesh.from_legacy(mesh).to(o3d.core.Device("CPU:0"))
+        mesh_filled_tensor = mesh_tensor.fill_holes(hole_size=hole_size)
+        mesh_filled = mesh_filled_tensor.to_legacy()
+        try:
+            mesh_filled.compute_vertex_normals()
+        except Exception:
+            pass
+        return mesh_filled
+    except Exception as e:
+        # 失败则原样返回
+        warnings.warn(f"tensor.fill_holes 失败，返回原网格: {e}")
+        return mesh
 
 def process_directory(input_dir, output_dir, method='poisson', 
                      depth=10, width=0, scale=1.1, linear_fit=False, device='CPU:0'):

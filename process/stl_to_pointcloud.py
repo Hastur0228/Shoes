@@ -5,14 +5,30 @@ import glob
 from pathlib import Path
 import argparse
 
+# PCA 对齐与归一化工具（兼容作为包运行或直接脚本运行）
+try:  # python -m process.stl_to_pointcloud
+    from .pca_align import PCAAlignConfig, pca_align_and_normalize
+except Exception:  # python process/stl_to_pointcloud.py
+    from pca_align import PCAAlignConfig, pca_align_and_normalize
+
  
 
 
-def stl_to_pointcloud(stl_file_path,
-                      output_path,
-                      num_points=300000,
-                      uniform_sampling=True,
-                      clean_mesh: bool = True):
+def stl_to_pointcloud(
+    stl_file_path,
+    output_path,
+    num_points=300000,
+    uniform_sampling=True,
+    clean_mesh: bool = True,
+    # 预处理：PCA 对齐、原点统一与尺度归一化
+    enable_pca_align: bool = True,
+    pca_origin: str = "heel",  # 'heel' | 'bottom'
+    pca_toe_positive_x: bool = True,
+    pca_heel_slice_ratio: float = 0.08,
+    pca_scale_mode: str = "none",  # 'none' | 'length' | 'width'
+    pca_target_length: float = 1.0,
+    pca_target_width: float = 1.0,
+):
     """
     从STL文件中采样点云并保存为.npy格式
     
@@ -61,12 +77,30 @@ def stl_to_pointcloud(stl_file_path,
             except Exception:
                 raise oe
 
-        # 获取点云数据
+        # 获取点云数据 (x, y, z, nx, ny, nz)
         points = np.asarray(pcd.points)
         normals = np.asarray(pcd.normals)
-        
-        # 组合点和法向量
         point_cloud_data = np.concatenate([points, normals], axis=1)
+
+        # 可选：PCA 对齐 + 原点统一 + 尺寸归一化 + 方向消歧
+        if enable_pca_align and point_cloud_data.shape[1] >= 3:
+            cfg = PCAAlignConfig(
+                toe_positive_x=pca_toe_positive_x,
+                origin_mode=pca_origin,
+                heel_slice_ratio=float(pca_heel_slice_ratio),
+                scale_mode=pca_scale_mode,
+                target_length=float(pca_target_length),
+                target_width=float(pca_target_width),
+            )
+            point_cloud_data, stats = pca_align_and_normalize(point_cloud_data, cfg)
+            # 输出对齐信息，便于确认
+            print(
+                f"  PCA 对齐完成 | origin={pca_origin}, toe+X={pca_toe_positive_x}, "
+                f"scale={pca_scale_mode}({stats.scale:.5f}) | bbox(Lx,Ly,Lz)={stats.length_xyz}"
+            )
+            print(
+                f"  对齐参数 | translation(origin)={stats.translation.tolist()}, sign_flips={stats.sign_flips.tolist()}"
+            )
         
         # 保存为.npy格式
         np.save(output_path, point_cloud_data)
@@ -83,11 +117,20 @@ def stl_to_pointcloud(stl_file_path,
         return False
 
 
-def process_directory(input_dir,
-                      output_dir,
-                      num_points=300000,
-                      uniform_sampling=True,
-                      clean_mesh: bool = True):
+def process_directory(
+    input_dir,
+    output_dir,
+    num_points=300000,
+    uniform_sampling=True,
+    clean_mesh: bool = True,
+    enable_pca_align: bool = True,
+    pca_origin: str = "heel",
+    pca_toe_positive_x: bool = True,
+    pca_heel_slice_ratio: float = 0.08,
+    pca_scale_mode: str = "none",
+    pca_target_length: float = 1.0,
+    pca_target_width: float = 1.0,
+):
     """
     处理目录中的所有STL文件
     
@@ -125,6 +168,13 @@ def process_directory(input_dir,
             num_points=num_points,
             uniform_sampling=uniform_sampling,
             clean_mesh=clean_mesh,
+            enable_pca_align=enable_pca_align,
+            pca_origin=pca_origin,
+            pca_toe_positive_x=pca_toe_positive_x,
+            pca_heel_slice_ratio=pca_heel_slice_ratio,
+            pca_scale_mode=pca_scale_mode,
+            pca_target_length=pca_target_length,
+            pca_target_width=pca_target_width,
         ):
             success_count += 1
     
@@ -146,6 +196,19 @@ def main():
                        help="只处理指定的子目录")
     parser.add_argument("--main_dir_only", action="store_true", 
                        help="只处理主目录，不处理子目录")
+
+    # 预处理（PCA/方向/原点/尺度）相关选项
+    parser.add_argument("--enable_pca_align", dest="enable_pca_align", action="store_true", help="启用 PCA 对齐与归一化")
+    parser.add_argument("--no_enable_pca_align", dest="enable_pca_align", action="store_false", help="禁用 PCA 对齐与归一化")
+    parser.set_defaults(enable_pca_align=True)
+    parser.add_argument("--pca_origin", type=str, default="heel", choices=["heel", "bottom"], help="原点统一方式")
+    parser.add_argument("--pca_toe_positive_x", dest="pca_toe_positive_x", action="store_true", help="脚尖朝 +X")
+    parser.add_argument("--no_pca_toe_positive_x", dest="pca_toe_positive_x", action="store_false", help="不强制脚尖朝 +X")
+    parser.set_defaults(pca_toe_positive_x=True)
+    parser.add_argument("--pca_heel_slice_ratio", type=float, default=0.08, help="脚跟/端部切片占总长的比例 [0, 0.3]")
+    parser.add_argument("--pca_scale_mode", type=str, default="none", choices=["none", "length", "width"], help="尺度归一化模式")
+    parser.add_argument("--pca_target_length", type=float, default=1.0, help="目标脚长（当 scale_mode=length）")
+    parser.add_argument("--pca_target_width", type=float, default=1.0, help="目标脚宽（当 scale_mode=width）")
     
     args = parser.parse_args()
     
@@ -159,16 +222,36 @@ def main():
         
         if os.path.exists(input_subdir):
             print(f"\n处理子目录: {args.subdir}")
-            process_directory(input_subdir, output_subdir,
-                              num_points=args.num_points,
-                              uniform_sampling=uniform_sampling)
+            process_directory(
+                    input_subdir,
+                    output_subdir,
+                    num_points=args.num_points,
+                    uniform_sampling=uniform_sampling,
+                    enable_pca_align=args.enable_pca_align,
+                    pca_origin=args.pca_origin,
+                    pca_toe_positive_x=args.pca_toe_positive_x,
+                    pca_heel_slice_ratio=args.pca_heel_slice_ratio,
+                    pca_scale_mode=args.pca_scale_mode,
+                    pca_target_length=args.pca_target_length,
+                    pca_target_width=args.pca_target_width,
+                )
         else:
             print(f"子目录不存在: {input_subdir}")
     elif args.main_dir_only:
         # 只处理主目录
-        process_directory(args.input_dir, args.output_dir,
-                          num_points=args.num_points,
-                          uniform_sampling=uniform_sampling)
+        process_directory(
+            args.input_dir,
+            args.output_dir,
+            num_points=args.num_points,
+            uniform_sampling=uniform_sampling,
+            enable_pca_align=args.enable_pca_align,
+            pca_origin=args.pca_origin,
+            pca_toe_positive_x=args.pca_toe_positive_x,
+            pca_heel_slice_ratio=args.pca_heel_slice_ratio,
+            pca_scale_mode=args.pca_scale_mode,
+            pca_target_length=args.pca_target_length,
+            pca_target_width=args.pca_target_width,
+        )
     else:
         # 默认处理所有子目录
         for subdir in ["feet", "insoles"]:
@@ -177,9 +260,19 @@ def main():
             
             if os.path.exists(input_subdir):
                 print(f"\n处理子目录: {subdir}")
-                process_directory(input_subdir, output_subdir,
-                                  num_points=args.num_points,
-                                  uniform_sampling=uniform_sampling)
+                process_directory(
+                    input_subdir,
+                    output_subdir,
+                    num_points=args.num_points,
+                    uniform_sampling=uniform_sampling,
+                    enable_pca_align=args.enable_pca_align,
+                    pca_origin=args.pca_origin,
+                    pca_toe_positive_x=args.pca_toe_positive_x,
+                    pca_heel_slice_ratio=args.pca_heel_slice_ratio,
+                    pca_scale_mode=args.pca_scale_mode,
+                    pca_target_length=args.pca_target_length,
+                    pca_target_width=args.pca_target_width,
+                )
             else:
                 print(f"子目录不存在: {input_subdir}")
 

@@ -48,9 +48,9 @@ $env:PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 ### 训练
 
 - 打开 `process/train_point2point.py`，顶部 `TrainConfig` 为默认配置：
-  - `num_points=200000`：数据层重采样到 20 万点
+  - `num_points=300000`：数据层重采样到 30 万点
   - `encode_points=4096`：进入 DGCNN 前的二次采样，避免 KNN 和特征图显存爆炸
-  - `gen_points=4096`：生成头输出较小点数（推理可再重采样到 200k）
+  - `gen_points=4096`：生成头输出较小点数（推理可再重采样到 300k）
   - `k=10`、`batch_size=1`、`num_workers=0`：大点云友好设置
   - `side_filter`: 设为 `'L'` 或 `'R'` 可实现左右脚分别训练；设为 `None` 使用两侧
 
@@ -83,12 +83,12 @@ python -m process.infer_point2point \
 # 批量（默认遍历 test/pointcloud/*.npy，输出到 output/pointcloud/）
 python -m process.infer_point2point \
   --checkpoint checkpoints/p2p_dgcnn/models/best.pt \
-  --target_points 200000
+  --target_points 300000
 ```
 
 两种方案的独立脚本：
 
-- 方案一：小生成头 + 推理阶段重采样到 200k（更省显存）
+- 方案一：小生成头 + 推理阶段重采样到 300k（更省显存）
 ```
 python -m process.infer_p2p_resample \
   --checkpoint checkpoints/p2p_dgcnn/models/best.pt \
@@ -96,7 +96,7 @@ python -m process.infer_p2p_resample \
   --target_points 300000
 ```
 
-- 方案二：推理时强制生成头直接输出 200k（显存更高，速度快）
+- 方案二：推理时强制生成头直接输出 300k（显存更高，速度快）
 ```
 python -m process.infer_p2p_dense \
   --checkpoint checkpoints/p2p_dgcnn/models/best.pt \

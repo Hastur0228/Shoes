@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+import argparse
 from typing import Optional
 
 import torch
@@ -26,6 +27,15 @@ except Exception:  # 兼容直接脚本运行
     from process.model import DGCNNPointCloud2PointCloud
     from process.util import IOStream, set_random_seeds
 
+# 可选：绘图依赖
+try:
+    import matplotlib
+    matplotlib.use("Agg")  # 非交互式后端，适合无显示环境
+    import matplotlib.pyplot as plt
+    _HAS_MPL = True
+except Exception:
+    _HAS_MPL = False
+
 
 @dataclass
 class TrainConfig:
@@ -40,7 +50,7 @@ class TrainConfig:
     batch_size: int = 1
     test_batch_size: int = 1
     epochs: int = 50
-    lr: float = 1e-3
+    lr: float = 1e-4
     momentum: float = 0.9
     use_sgd: bool = False
     # 大规模点云下邻居不宜过大
@@ -193,6 +203,12 @@ def train(cfg: Optional[TrainConfig] = None):
     best_val = float("inf")
     best_epoch = 0
     no_improve_epochs = 0
+    # 记录曲线
+    epochs_hist: list[int] = []
+    train_hist: list[float] = []
+    val_hist: list[float] = []
+    acc_hist: list[float] = []
+    lr_hist: list[float] = []
     for epoch in range(1, cfg.epochs + 1):
         model.train()
         running = 0.0
@@ -294,13 +310,24 @@ def train(cfg: Optional[TrainConfig] = None):
         io.cprint(
             f"Epoch {epoch:03d} | train {train_loss:.6f} | val {val_loss:.6f} | acc {acc_val:.4f} | lr {scheduler.get_last_lr()[0]:.2e}"
         )
+        # 记录当轮指标
+        epochs_hist.append(epoch)
+        train_hist.append(float(train_loss))
+        val_hist.append(float(val_loss))
+        acc_hist.append(float(acc_val))
+        lr_hist.append(float(scheduler.get_last_lr()[0]))
 
         # 早停与最优保存
         if (best_val - val_loss) > cfg.early_stop_min_delta:
             best_val = val_loss
             best_epoch = epoch
             no_improve_epochs = 0
-            best_path = os.path.join(model_dir, "best.pt")
+            # 侧别保存不同 best 权重名称
+            if cfg.side_filter in ("L", "R"):
+                best_filename = f"best_{cfg.side_filter}.pt"
+            else:
+                best_filename = "best.pt"
+            best_path = os.path.join(model_dir, best_filename)
             torch.save({
                 "epoch": epoch,
                 "model": model.state_dict(),
@@ -325,8 +352,64 @@ def train(cfg: Optional[TrainConfig] = None):
 
     io.close()
 
+    # 训练完成后，保存曲线图与 CSV
+    try:
+        import csv as _csv
+        csv_path = os.path.join(exp_dir, "metrics.csv")
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = _csv.writer(f)
+            w.writerow(["epoch", "train_loss", "val_loss", "acc", "lr"])
+            for i in range(len(epochs_hist)):
+                w.writerow([epochs_hist[i], train_hist[i], val_hist[i], acc_hist[i], lr_hist[i]])
+        print(f"已保存训练度量到: {csv_path}")
+    except Exception:
+        pass
+
+    if _HAS_MPL:
+        try:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.plot(epochs_hist, train_hist, label="train_loss", color="#1f77b4")
+            ax.plot(epochs_hist, val_hist, label="val_loss", color="#ff7f0e")
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel("Loss")
+            ax.set_title("Training/Validation Loss")
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+            fig.tight_layout()
+            fig_path = os.path.join(exp_dir, "loss_curve.png")
+            fig.savefig(fig_path, dpi=150)
+            plt.close(fig)
+            print(f"已保存损失曲线图到: {fig_path}")
+        except Exception:
+            print("绘制损失曲线失败（已跳过）。")
+    else:
+        print("未安装 matplotlib 或无法使用绘图后端，已跳过曲线图保存；CSV 已保存。")
+
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser(description="Train point-to-point model; support side-specific training and best_{L|R}.pt saving")
+    parser.add_argument("--side", choices=["L", "R", "both", "all"], default="both", help="选择训练侧别：L / R / both(分别训练左右) / all(不区分)")
+    parser.add_argument("--exp_name", type=str, default="p2p_dgcnn", help="实验名（用于 checkpoints/<exp_name>）")
+    parser.add_argument("--data_root", type=str, default=os.path.join("data", "pointcloud"))
+    args = parser.parse_args()
+
+    def _run(side_filter: str | None):
+        cfg = TrainConfig()
+        # 默认按侧别自动区分实验名：<exp_name>_L / <exp_name>_R
+        if side_filter in ("L", "R"):
+            cfg.exp_name = f"{args.exp_name}_{side_filter}"
+        else:
+            cfg.exp_name = args.exp_name
+        cfg.data_root = args.data_root
+        cfg.side_filter = side_filter
+        train(cfg)
+
+    if args.side == "both":
+        _run("L")
+        _run("R")
+    elif args.side in ("L", "R"):
+        _run(args.side)
+    else:
+        _run(None)
 
 

@@ -72,7 +72,7 @@ def infer_single(input_path: str, output_path: str, model, device: torch.device,
     print(f"最终点云点数: {pred_np.shape[0]}")
 
 
-def infer_batch(test_root: str, feet_subdir: str, output_root: str, output_subdir: str, model, device: torch.device, num_points: int, input_dims: int, target_points: int):
+def infer_batch(test_root: str, feet_subdir: str, output_root: str, output_subdir: str, model_L, model_R, device: torch.device, num_points: int, input_dims: int, target_points: int):
     # 输入目录：优先使用子目录（若存在），否则直接使用 test_root
     candidate_dir = os.path.join(test_root, feet_subdir) if feet_subdir else test_root
     feet_dir = candidate_dir if os.path.isdir(candidate_dir) else test_root
@@ -89,9 +89,10 @@ def infer_batch(test_root: str, feet_subdir: str, output_root: str, output_subdi
         foot_path = os.path.join(feet_dir, fname)
         m = _FOOT_PATTERN.match(fname)
         assert m is not None
-        pid, side = m.group(1), m.group(2)
+        pid, side = m.group(1), m.group(2).upper()
         out_name = f"{pid}_insole_{side}.npy"
         out_path = os.path.join(out_dir, out_name)
+        model = model_L if side == 'L' else model_R if model_R is not None else model_L
         infer_single(foot_path, out_path, model, device, num_points, input_dims, target_points)
     print("全部完成。")
 
@@ -107,7 +108,8 @@ def main():
     parser.add_argument("--output_root", default=os.path.join("output", "pointcloud"), help="输出根目录")
     parser.add_argument("--output_subdir", default="insoles", help="可选：输出子目录；为空则直接输出到 output_root 下")
     # 通用
-    parser.add_argument("--checkpoint", default=os.path.join("checkpoints", "p2p_dgcnn", "models", "best.pt"), help="模型权重路径")
+    parser.add_argument("--checkpoint_L", default=os.path.join("checkpoints", "p2p_dgcnn", "models", "best_L.pt"), help="左脚模型权重路径")
+    parser.add_argument("--checkpoint_R", default=os.path.join("checkpoints", "p2p_dgcnn", "models", "best_R.pt"), help="右脚模型权重路径（可选；未提供则使用左脚模型）")
     # 编码输入点数：建议保持在 2048~8192，避免 KNN 图构建 OOM
     parser.add_argument("--num_points", type=int, default=4096, help="编码输入重采样点数（建议 2048~8192）")
     parser.add_argument("--target_points", type=int, default=300000, help="最终输出点云点数")
@@ -116,14 +118,31 @@ def main():
     args = parser.parse_args()
 
     device = torch.device(args.device)
-    model, input_dims, trained_num_points = load_model(args.checkpoint, num_points=args.num_points, device=device)
+    model_L, input_dims, trained_num_points = load_model(args.checkpoint_L, num_points=args.num_points, device=device)
+    model_R = None
+    if args.checkpoint_R and os.path.exists(args.checkpoint_R):
+        try:
+            model_R, _, _ = load_model(args.checkpoint_R, num_points=args.num_points, device=device)
+        except Exception as _:
+            model_R = None
 
     if args.input is not None and args.output is not None:
-        infer_single(args.input, args.output, model, device, args.num_points, input_dims, args.target_points, args.secondary_points)
+        # 根据文件名识别侧别，选择模型
+        side = None
+        m = _FOOT_PATTERN.match(os.path.basename(args.input))
+        if m is not None:
+            side = m.group(2).upper()
+        mdl = model_L if (side == 'L' or model_R is None) else model_R
+        infer_single(args.input, args.output, mdl, device, args.num_points, input_dims, args.target_points, args.secondary_points)
     else:
         # 批处理内部调用单样本接口，保持相同二次采样与插值逻辑
         def _infer_single_wrapper(ip, op):
-            infer_single(ip, op, model, device, args.num_points, input_dims, args.target_points, args.secondary_points)
+            side = None
+            m = _FOOT_PATTERN.match(os.path.basename(ip))
+            if m is not None:
+                side = m.group(2).upper()
+            mdl = model_L if (side == 'L' or model_R is None) else model_R
+            infer_single(ip, op, mdl, device, args.num_points, input_dims, args.target_points, args.secondary_points)
         # 复用现有批处理遍历代码
         # 由于原函数签名不同，这里直接遍历实现
         candidate_dir = os.path.join(args.test_root, args.feet_subdir) if args.feet_subdir else args.test_root

@@ -10,5 +10,6 @@ open3d>=0.17.0
 
 # Utils
 tqdm>=4.65
+matplotlib>=3.7
 
 

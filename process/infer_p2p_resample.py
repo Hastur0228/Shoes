@@ -63,7 +63,7 @@ def infer_single(input_path: str, output_path: str, model, device: torch.device,
     print(f"最终点云点数: {pred_np.shape[0]}")
 
 
-def infer_batch(test_root: str, feet_subdir: str, output_root: str, output_subdir: str, model, device: torch.device, encode_points: int, input_dims: int, target_points: int, include_all_npy: bool = False, recursive: bool = False):
+def infer_batch(test_root: str, feet_subdir: str, output_root: str, output_subdir: str, model_L, model_R, device: torch.device, encode_points: int, input_dims: int, target_points: int, include_all_npy: bool = False, recursive: bool = False):
     candidate_dir = os.path.join(test_root, feet_subdir) if feet_subdir else test_root
     feet_dir = candidate_dir if os.path.isdir(candidate_dir) else test_root
     out_dir = os.path.join(output_root, output_subdir) if output_subdir else output_root
@@ -98,7 +98,8 @@ def infer_batch(test_root: str, feet_subdir: str, output_root: str, output_subdi
                 out_base = base + "_insole"
             out_name = out_base + ".npy"
         out_path = os.path.join(out_dir, out_name)
-        infer_single(foot_path, out_path, model, device, encode_points, input_dims, target_points)
+        mdl = model_L if (m is None or m.group(2).upper() == 'L' or model_R is None) else model_R
+        infer_single(foot_path, out_path, mdl, device, encode_points, input_dims, target_points)
     print("全部完成。")
 
 
@@ -110,7 +111,8 @@ def main():
     parser.add_argument("--feet_subdir", default="")
     parser.add_argument("--output_root", default=os.path.join("output", "pointcloud"))
     parser.add_argument("--output_subdir", default="insoles")
-    parser.add_argument("--checkpoint", default=os.path.join("checkpoints", "p2p_dgcnn", "models", "best.pt"))
+    parser.add_argument("--checkpoint_L", default=os.path.join("checkpoints", "p2p_dgcnn", "models", "best_L.pt"))
+    parser.add_argument("--checkpoint_R", default=os.path.join("checkpoints", "p2p_dgcnn", "models", "best_R.pt"))
     # 编码点数务必保持较小（如 2048/4096），否则 KNN 图构建会 OOM
     parser.add_argument("--encode_points", type=int, default=4096, help="进入模型前的编码点数（建议 2048~8192）")
     parser.add_argument("--target_points", type=int, default=300000, help="最终输出点数")
@@ -120,17 +122,30 @@ def main():
     args = parser.parse_args()
 
     device = torch.device(args.device)
-    model, input_dims = load_model(args.checkpoint, num_points=args.encode_points, device=device)
+    model_L, input_dims = load_model(args.checkpoint_L, num_points=args.encode_points, device=device)
+    model_R = None
+    if args.checkpoint_R and os.path.exists(args.checkpoint_R):
+        try:
+            model_R, _ = load_model(args.checkpoint_R, num_points=args.encode_points, device=device)
+        except Exception:
+            model_R = None
 
     if args.input and args.output:
-        infer_single(args.input, args.output, model, device, args.encode_points, input_dims, args.target_points)
+        # 单文件按侧选择模型
+        side = None
+        m = _FOOT_PATTERN.match(os.path.basename(args.input))
+        if m is not None:
+            side = m.group(2).upper()
+        mdl = model_L if (side == 'L' or model_R is None) else model_R
+        infer_single(args.input, args.output, mdl, device, args.encode_points, input_dims, args.target_points)
     else:
         infer_batch(
             args.test_root,
             args.feet_subdir,
             args.output_root,
             args.output_subdir,
-            model,
+            model_L,
+            model_R,
             device,
             args.encode_points,
             input_dims,
