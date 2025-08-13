@@ -53,6 +53,12 @@ def pointcloud_to_stl(
     lcc_min_triangles=200,
     orient_triangles=True,
     suppress_native_warnings=False,
+    clip_to_input_bounds=True,
+    clip_margin_scale=2.0,
+    remove_small_components=True,
+    min_component_area_ratio=0.02,
+    trim_by_distance=True,
+    trim_distance_multiplier=3.0,
 ):
     """
     从点云文件重建STL网格并保存
@@ -227,7 +233,21 @@ def pointcloud_to_stl(
         else:
             raise ValueError(f"不支持的重建方法: {method}")
 
-        # 网格后处理：清理、连通片、平滑、洞填补、方向
+        # 计算输入点云边界与裁剪margin
+        pts_np_for_bounds = np.asarray(pcd.points)
+        bounds_min = pts_np_for_bounds.min(axis=0)
+        bounds_max = pts_np_for_bounds.max(axis=0)
+        # 估计邻域尺度
+        try:
+            nn_dists = pcd.compute_nearest_neighbor_distance()
+            mean_nn = float(np.mean(nn_dists)) if len(nn_dists) > 0 else 0.0
+        except Exception:
+            mean_nn = 0.0
+        diag = float(np.linalg.norm(bounds_max - bounds_min))
+        default_margin = diag * 0.01 if diag > 0 else 1e-3
+        clip_margin = float(clip_margin_scale) * mean_nn if mean_nn > 0 else default_margin
+
+        # 网格后处理：裁剪、清理、连通片、平滑、洞填补、方向
         mesh = postprocess_mesh(
             mesh,
             fill_holes=fill_holes,
@@ -238,6 +258,16 @@ def pointcloud_to_stl(
             keep_largest_component=keep_largest_component,
             lcc_min_triangles=lcc_min_triangles,
             orient_triangles=orient_triangles,
+            clip_to_input_bounds=clip_to_input_bounds,
+            bounds_min=bounds_min,
+            bounds_max=bounds_max,
+            clip_margin=clip_margin,
+            remove_small_components=remove_small_components,
+            min_component_area_ratio=min_component_area_ratio,
+            reference_points=pts_np_for_bounds,
+            mean_nn_distance=mean_nn,
+            trim_by_distance=trim_by_distance,
+            trim_distance_multiplier=trim_distance_multiplier,
         )
         
         # 保存为STL文件
@@ -411,6 +441,16 @@ def postprocess_mesh(
     keep_largest_component: bool = True,
     lcc_min_triangles: int = 200,
     orient_triangles: bool = True,
+    clip_to_input_bounds: bool = True,
+    bounds_min: Any | None = None,
+    bounds_max: Any | None = None,
+    clip_margin: float = 0.0,
+    remove_small_components: bool = True,
+    min_component_area_ratio: float = 0.02,
+    reference_points: Any | None = None,
+    mean_nn_distance: float | None = None,
+    trim_by_distance: bool = True,
+    trim_distance_multiplier: float = 3.0,
 ) -> Any:
     """通用网格后处理，提升完整性与光滑度。"""
     o3d = _import_open3d()
@@ -422,6 +462,23 @@ def postprocess_mesh(
         mesh.remove_non_manifold_edges()
     except Exception:
         pass
+
+    # 先按输入点云边界裁剪，去掉超出AABB+margin的冗余表面（常见于Poisson包络环）
+    if clip_to_input_bounds and bounds_min is not None and bounds_max is not None:
+        try:
+            v = np.asarray(mesh.vertices)
+            t = np.asarray(mesh.triangles)
+            lo = np.asarray(bounds_min) - float(clip_margin)
+            hi = np.asarray(bounds_max) + float(clip_margin)
+            tri_vertices = v[t]
+            # 三角形任一顶点在边界外则移除
+            outside = np.logical_or(tri_vertices < lo, tri_vertices > hi).any(axis=(1, 2))
+            if outside.any():
+                mesh.remove_triangles_by_mask(outside)
+                mesh.remove_unreferenced_vertices()
+                print(f"  已按输入AABB裁剪三角形: {int(outside.sum())}")
+        except Exception as e_clip:
+            warnings.warn(f"AABB裁剪失败: {e_clip}")
 
     if keep_largest_component:
         try:
@@ -446,6 +503,70 @@ def postprocess_mesh(
                     print(f"  已保留最大连通片 (triangles={int(cluster_n_triangles[largest_idx])})")
         except Exception as e_cc:
             warnings.warn(f"连通片聚类失败: {e_cc}")
+
+    # 按顶点到输入点云的最近距离剔除远离的三角形（常见包络环通常远离原始点云）
+    if trim_by_distance and reference_points is not None:
+        try:
+            o3d = _import_open3d()
+            ref_pcd = o3d.geometry.PointCloud()
+            ref_pcd.points = o3d.utility.Vector3dVector(np.asarray(reference_points))
+            kdtree = o3d.geometry.KDTreeFlann(ref_pcd)
+            v = np.asarray(mesh.vertices)
+            n_vertices = v.shape[0]
+            dists = np.empty(n_vertices, dtype=np.float64)
+            # 逐点查询最近邻距离
+            for i in range(n_vertices):
+                _, idx, sq = kdtree.search_knn_vector_3d(v[i], 1)
+                if len(sq) > 0:
+                    dists[i] = float(np.sqrt(sq[0]))
+                else:
+                    dists[i] = np.inf
+            # 阈值：mean_nn * multiplier（兜底用对角线的1%）
+            if mean_nn_distance is None or mean_nn_distance <= 0:
+                ref = np.asarray(reference_points)
+                diag = float(np.linalg.norm(ref.max(axis=0) - ref.min(axis=0)))
+                base = diag * 0.01
+            else:
+                base = float(mean_nn_distance)
+            thr = base * float(trim_distance_multiplier)
+            t = np.asarray(mesh.triangles)
+            tri_thr = np.all(dists[t] > thr, axis=1)
+            if tri_thr.any():
+                mesh.remove_triangles_by_mask(tri_thr)
+                mesh.remove_unreferenced_vertices()
+                print(f"  已按距离阈值剔除三角形: {int(tri_thr.sum())} (thr={thr:.6f})")
+        except Exception as e_trim:
+            warnings.warn(f"距离裁剪失败: {e_trim}")
+
+    # 按连通片面积比例剔除很小片段（在不启用 keep_largest_component 的情况下也可工作）
+    if remove_small_components:
+        try:
+            labels, cluster_n_triangles, _ = mesh.cluster_connected_triangles()
+            labels = np.asarray(labels)
+            if labels.size > 0:
+                v = np.asarray(mesh.vertices)
+                t = np.asarray(mesh.triangles)
+                tri = v[t]
+                tri_areas = 0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
+                # 聚合每个簇的面积
+                num_clusters = int(labels.max()) + 1 if labels.max() >= 0 else 0
+                if num_clusters > 0:
+                    cluster_areas = np.zeros(num_clusters, dtype=np.float64)
+                    for idx in range(num_clusters):
+                        cluster_areas[idx] = float(tri_areas[labels == idx].sum())
+                    if cluster_areas.size > 0 and cluster_areas.max() > 0:
+                        largest_area = float(cluster_areas.max())
+                        # 需要移除的簇：面积比例过小 且 三角形数也较少
+                        remove_clusters = [idx for idx, area in enumerate(cluster_areas)
+                                           if (area / largest_area) < float(min_component_area_ratio)
+                                           and int(cluster_n_triangles[idx]) < int(lcc_min_triangles)]
+                        if len(remove_clusters) > 0:
+                            remove_mask = np.isin(labels, np.array(remove_clusters, dtype=np.int32))
+                            mesh.remove_triangles_by_mask(remove_mask)
+                            mesh.remove_unreferenced_vertices()
+                            print(f"  已按面积比例剔除连通片: {len(remove_clusters)} (ratio<{float(min_component_area_ratio):.3f})")
+        except Exception as e_small:
+            warnings.warn(f"小连通片剔除失败: {e_small}")
 
     if fill_holes:
         try:
@@ -597,6 +718,19 @@ def main():
     parser.add_argument('--suppress-native-warnings', dest='suppress_native_warnings', action='store_true', help='尽量捕获底层 PoissonRecon 的控制台警告')
     parser.add_argument('--no-suppress-native-warnings', dest='suppress_native_warnings', action='store_false', help='不捕获底层 PoissonRecon 控制台输出')
     parser.set_defaults(suppress_native_warnings=False)
+    # 剪裁与小片段移除
+    parser.add_argument('--clip-to-input-bounds', dest='clip_to_input_bounds', action='store_true', help='裁剪超出输入点云AABB+margin的三角形（默认启用）')
+    parser.add_argument('--no-clip-to-input-bounds', dest='clip_to_input_bounds', action='store_false', help='不进行AABB裁剪')
+    parser.set_defaults(clip_to_input_bounds=True)
+    parser.add_argument('--clip-margin-scale', type=float, default=2.0, help='AABB裁剪的邻域半径倍数（缺省用对角线1%%）')
+    parser.add_argument('--remove-small-components', dest='remove_small_components', action='store_true', help='按面积比例剔除很小连通片（默认启用）')
+    parser.add_argument('--no-remove-small-components', dest='remove_small_components', action='store_false', help='不剔除小连通片')
+    parser.set_defaults(remove_small_components=True)
+    parser.add_argument('--min-component-area-ratio', type=float, default=0.02, help='相对最大面的最小连通片面积比例阈值')
+    parser.add_argument('--trim-by-distance', dest='trim_by_distance', action='store_true', help='按顶点到输入点云的最近距离剔除远离的三角形（默认启用）')
+    parser.add_argument('--no-trim-by-distance', dest='trim_by_distance', action='store_false', help='不进行距离裁剪')
+    parser.set_defaults(trim_by_distance=True)
+    parser.add_argument('--trim-distance-multiplier', type=float, default=3.0, help='距离裁剪阈值=均值邻域距离×该倍率（兜底用对角线1%%）')
 
     # 兼容下方对 args.device 的引用（目前重建过程仅使用CPU，此参数仅为接口一致性）
     parser.add_argument('--device', type=str, default='cpu', help='计算设备（当前未使用，仅为兼容接口）')
@@ -640,6 +774,12 @@ def main():
         lcc_min_triangles=args.lcc_min_triangles,
         orient_triangles=args.orient_triangles,
         suppress_native_warnings=args.suppress_native_warnings,
+        clip_to_input_bounds=args.clip_to_input_bounds,
+        clip_margin_scale=args.clip_margin_scale,
+        remove_small_components=args.remove_small_components,
+        min_component_area_ratio=args.min_component_area_ratio,
+        trim_by_distance=args.trim_by_distance,
+        trim_distance_multiplier=args.trim_distance_multiplier,
     )
     
     # 处理单个文件或目录
