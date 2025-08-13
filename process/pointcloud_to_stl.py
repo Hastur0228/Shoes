@@ -405,10 +405,20 @@ def postprocess_mesh(
             if len(cluster_n_triangles) > 0:
                 largest_idx = int(np.argmax(cluster_n_triangles))
                 labels = np.asarray(triangle_clusters)
-                mask = labels != largest_idx
-                if mask.sum() > 0:
-                    mesh.remove_triangles_by_mask(mask)
-                    mesh.remove_unreferenced_vertices()
+                # 保留“最大连通片 + 所有三角形数≥阈值的连通片”
+                if lcc_min_triangles is not None and int(lcc_min_triangles) > 0:
+                    keep_set = {largest_idx}
+                    keep_set.update([idx for idx, ntri in enumerate(cluster_n_triangles) if int(ntri) >= int(lcc_min_triangles)])
+                    remove_mask = np.isin(labels, list(keep_set), invert=True)
+                    if remove_mask.sum() > 0:
+                        mesh.remove_triangles_by_mask(remove_mask)
+                        mesh.remove_unreferenced_vertices()
+                    print(f"  已保留 {len(keep_set)} 个连通片 (>= {int(lcc_min_triangles)} triangles; 最大片={int(cluster_n_triangles[largest_idx])})")
+                else:
+                    mask = labels != largest_idx
+                    if mask.sum() > 0:
+                        mesh.remove_triangles_by_mask(mask)
+                        mesh.remove_unreferenced_vertices()
                     print(f"  已保留最大连通片 (triangles={int(cluster_n_triangles[largest_idx])})")
         except Exception as e_cc:
             warnings.warn(f"连通片聚类失败: {e_cc}")
