@@ -6,11 +6,61 @@ from pathlib import Path
 import argparse
 from tqdm import tqdm
 import warnings
+from typing import Tuple
+from scipy.interpolate import Rbf
+from scipy.spatial import cKDTree
+from scipy import ndimage
 try:
     import pymeshfix  # type: ignore
     _HAS_PYMESHFIX = True
 except Exception:
     _HAS_PYMESHFIX = False
+
+def _align_plane_to_z_inplace(pcd: o3d.geometry.PointCloud) -> None:
+    """
+    估计点云支撑面法向并将其对齐到 +Z 方向，仅做旋转，不压平。
+
+    优先使用 RANSAC 平面分割获得法向；失败则回退到 PCA。
+    """
+    if len(pcd.points) == 0:
+        return
+    pts_np = np.asarray(pcd.points)
+    centroid = pts_np.mean(axis=0)
+    normal = None
+    # Try RANSAC plane segmentation for robust normal
+    try:
+        plane_model, inliers = pcd.segment_plane(distance_threshold=2.0, ransac_n=3, num_iterations=2000)
+        # plane_model: [a, b, c, d]; normal = (a,b,c)
+        normal = np.array(plane_model[:3], dtype=np.float64)
+    except Exception:
+        normal = None
+    if normal is None or not np.isfinite(normal).all() or np.linalg.norm(normal) < 1e-12:
+        # PCA fallback
+        centered = pts_np - centroid
+        cov = centered.T @ centered / max(1, centered.shape[0] - 1)
+        evals, evecs = np.linalg.eigh(cov)
+        normal = evecs[:, int(np.argmin(evals))]
+    normal = normal / (np.linalg.norm(normal) + 1e-12)
+    # Rotate normal to +Z
+    target = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    v = np.cross(normal, target)
+    c = float(np.dot(normal, target))
+    if np.linalg.norm(v) < 1e-12 and c > 0.999999:
+        return
+    vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]], dtype=np.float64)
+    R = np.eye(3) + vx + (vx @ vx) * (1.0 / (1.0 + c + 1e-12))
+    pts_rot = (pts_np - centroid) @ R.T + centroid
+    pcd.points = o3d.utility.Vector3dVector(pts_rot)
+
+def _force_normals_upwards_inplace(pcd: o3d.geometry.PointCloud) -> None:
+    """将法向的 Z 分量统一为非负（朝向 +Z）。"""
+    if len(pcd.normals) == 0:
+        return
+    n = np.asarray(pcd.normals)
+    flip_mask = n[:, 2] < 0
+    if flip_mask.any():
+        n[flip_mask] *= -1.0
+        pcd.normals = o3d.utility.Vector3dVector(n)
 
 
 def pointcloud_to_stl(
@@ -39,6 +89,17 @@ def pointcloud_to_stl(
     smooth_method='taubin',
     smooth_iterations=50,
     decimate_target_triangles=0,
+    # Height-field specific parameters
+    hf_grid_res_mm=1.5,
+    hf_method='rbf',
+    hf_rbf_function='thin_plate',
+    hf_rbf_smooth=2.0,
+    hf_median_radius_mm=3.0,
+    hf_gaussian_sigma_px=2.0,
+    hf_close_size_px=3,
+    hf_mask_dilate_iters=1,
+    hf_mask_close_size=3,
+    hf_max_samples=20000,
 ):
     """
     从点云文件重建STL网格并保存
@@ -65,6 +126,7 @@ def pointcloud_to_stl(
         smooth_method (str): 网格平滑方法：'none'|'simple'|'laplacian'|'taubin'
         smooth_iterations (int): 平滑迭代次数
         decimate_target_triangles (int): 四元误差网格简化目标三角形数，<=0 禁用
+        hf_*: 2.5D 高度场重建相关参数
     """
     try:
         # 加载点云数据
@@ -173,6 +235,8 @@ def pointcloud_to_stl(
                 pcd.normalize_normals()
             except Exception:
                 pass
+            # 强制法向朝 +Z
+            _force_normals_upwards_inplace(pcd)
 
         # 根据选择的方法进行网格重建
         if method.lower() == 'poisson':
@@ -189,6 +253,25 @@ def pointcloud_to_stl(
             mesh = reconstruct_ball_pivoting(pcd, width)
         elif method.lower() == 'alpha_shape':
             mesh = reconstruct_alpha_shape(pcd, alpha=width)
+        elif method.lower() in ('height_field', 'height', 'heightmap'):
+            # 确保姿态统一（支撑面法向 = +Z）
+            try:
+                _align_plane_to_z_inplace(pcd)
+            except Exception as e:
+                warnings.warn(f"对齐支撑面到 +Z 失败（将继续）：{e}")
+            mesh = reconstruct_height_field(
+                pcd,
+                grid_res_mm=hf_grid_res_mm,
+                method=hf_method,
+                rbf_function=hf_rbf_function,
+                rbf_smooth=hf_rbf_smooth,
+                median_radius_mm=hf_median_radius_mm,
+                gaussian_sigma_px=hf_gaussian_sigma_px,
+                close_size_px=hf_close_size_px,
+                mask_dilate_iters=hf_mask_dilate_iters,
+                mask_close_size=hf_mask_close_size,
+                max_samples=int(hf_max_samples),
+            )
         else:
             raise ValueError(f"不支持的重建方法: {method}")
 
@@ -252,6 +335,137 @@ def pointcloud_to_stl(
     except Exception as e:
         print(f"处理文件 {pointcloud_file_path} 时出错: {str(e)}")
         return False
+
+def reconstruct_height_field(
+    pcd: o3d.geometry.PointCloud,
+    grid_res_mm: float = 1.5,
+    method: str = 'rbf',
+    rbf_function: str = 'thin_plate',
+    rbf_smooth: float = 2.0,
+    median_radius_mm: float = 3.0,
+    gaussian_sigma_px: float = 2.0,
+    close_size_px: int = 3,
+    mask_dilate_iters: int = 1,
+    mask_close_size: int = 3,
+    max_samples: int = 20000,
+) -> o3d.geometry.TriangleMesh:
+    """
+    2.5D 高度场拟合与网格生成：
+    - 将点投影到 XY，构建规则网格（1–2 mm 分辨率）
+    - 鲁棒插值生成 z=f(x,y)：RBF(薄板样条+平滑) 或 局部中值 + 高斯平滑
+    - 对高度图进行形态学闭运算/高斯滤波，掩膜外形轮廓
+    - 规则三角剖分生成网格
+    """
+    pts = np.asarray(pcd.points)
+    if pts.size == 0:
+        return o3d.geometry.TriangleMesh()
+    # Bounds & grid
+    x_min, y_min = np.min(pts[:, 0]), np.min(pts[:, 1])
+    x_max, y_max = np.max(pts[:, 0]), np.max(pts[:, 1])
+    res = float(max(1e-6, grid_res_mm))
+    xs = np.arange(x_min, x_max + res, res)
+    ys = np.arange(y_min, y_max + res, res)
+    nx, ny = len(xs), len(ys)
+    Xg, Yg = np.meshgrid(xs, ys)
+    # Occupancy mask from points
+    occ = np.zeros((ny, nx), dtype=bool)
+    ix = np.clip(((pts[:, 0] - x_min) / res).astype(int), 0, nx - 1)
+    iy = np.clip(((pts[:, 1] - y_min) / res).astype(int), 0, ny - 1)
+    occ[iy, ix] = True
+    if mask_dilate_iters > 0:
+        occ = ndimage.binary_dilation(occ, iterations=int(mask_dilate_iters))
+    if mask_close_size and mask_close_size > 1:
+        structure = np.ones((int(mask_close_size), int(mask_close_size)), dtype=bool)
+        occ = ndimage.binary_closing(occ, structure=structure)
+    occ = ndimage.binary_fill_holes(occ)
+    # Interpolation
+    Z = np.full((ny, nx), np.nan, dtype=np.float64)
+    if (method or '').lower() == 'rbf':
+        # Subsample for speed if needed
+        src = pts
+        if max_samples and src.shape[0] > int(max_samples):
+            sel = np.random.choice(src.shape[0], int(max_samples), replace=False)
+            src = src[sel]
+        try:
+            rbf = Rbf(src[:, 0], src[:, 1], src[:, 2], function=rbf_function, smooth=float(rbf_smooth))
+            Z_vals = rbf(Xg[occ], Yg[occ])
+            Z[occ] = Z_vals
+        except Exception as e:
+            warnings.warn(f"RBF 拟合失败，回退到最近邻: {e}")
+            tree = cKDTree(pts[:, :2])
+            d, idx = tree.query(np.c_[Xg[occ], Yg[occ]], k=1)
+            Z[occ] = pts[idx, 2]
+    else:
+        # median + Gaussian
+        tree = cKDTree(pts[:, :2])
+        radius = float(max(1e-6, median_radius_mm))
+        q_xy = np.c_[Xg[occ], Yg[occ]]
+        ind_lists = tree.query_ball_point(q_xy, r=radius)
+        z_vals = np.empty(len(ind_lists), dtype=np.float64)
+        for i, inds in enumerate(ind_lists):
+            if len(inds) == 0:
+                z_vals[i] = np.nan
+            else:
+                z_vals[i] = np.median(pts[inds, 2])
+        Z[occ] = z_vals
+    # Fill NaNs inside mask using nearest neighbor for stability
+    if np.isnan(Z[occ]).any():
+        tree = cKDTree(pts[:, :2])
+        nan_mask = occ & np.isnan(Z)
+        if nan_mask.any():
+            d, idx = tree.query(np.c_[Xg[nan_mask], Yg[nan_mask]], k=1)
+            Z[nan_mask] = pts[idx, 2]
+    # Morphological closing (grey) and Gaussian smoothing
+    if close_size_px and int(close_size_px) > 1:
+        try:
+            Z_cl = ndimage.grey_closing(Z, size=(int(close_size_px), int(close_size_px)))
+            Z[occ] = Z_cl[occ]
+        except Exception:
+            pass
+    if gaussian_sigma_px and float(gaussian_sigma_px) > 0:
+        try:
+            # Replace outside-mask with edge values to avoid bleeding, then filter, then restore NaNs outside
+            Z_pad = Z.copy()
+            # Simple inpainting by nearest before smoothing
+            outside = ~occ
+            if outside.any():
+                # Use distance transform to get nearest inside index
+                dist, (iy_idx, ix_idx) = ndimage.distance_transform_edt(outside, return_indices=True)
+                Z_pad[outside] = Z[iy_idx[outside], ix_idx[outside]]
+            Z_sm = ndimage.gaussian_filter(Z_pad, sigma=float(gaussian_sigma_px))
+            Z[occ] = Z_sm[occ]
+        except Exception:
+            pass
+    # Build mesh from grid (only connect fully valid quads)
+    valid = occ & np.isfinite(Z)
+    h, w = Z.shape
+    vert_idx = -np.ones((h, w), dtype=int)
+    vertices = []
+    for i in range(h):
+        for j in range(w):
+            if valid[i, j]:
+                vert_idx[i, j] = len(vertices)
+                vertices.append([Xg[i, j], Yg[i, j], Z[i, j]])
+    triangles = []
+    for i in range(h - 1):
+        for j in range(w - 1):
+            if valid[i, j] and valid[i + 1, j] and valid[i, j + 1] and valid[i + 1, j + 1]:
+                v00 = vert_idx[i, j]
+                v10 = vert_idx[i + 1, j]
+                v01 = vert_idx[i, j + 1]
+                v11 = vert_idx[i + 1, j + 1]
+                triangles.append([v00, v10, v01])
+                triangles.append([v11, v01, v10])
+    mesh = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(np.asarray(vertices, dtype=np.float64)),
+        o3d.utility.Vector3iVector(np.asarray(triangles, dtype=np.int32)),
+    )
+    try:
+        mesh.compute_vertex_normals()
+    except Exception:
+        pass
+    # 轻量 Taubin 平滑（默认由上层 smooth_method 控制）。
+    return mesh
 
 
 def reconstruct_poisson(pcd, depth=10, width=0, scale=1.1, linear_fit=False,
@@ -480,6 +694,17 @@ def process_directory(
     smooth_method='taubin',
     smooth_iterations=50,
     decimate_target_triangles=0,
+    # Height-field specific parameters
+    hf_grid_res_mm=1.5,
+    hf_method='rbf',
+    hf_rbf_function='thin_plate',
+    hf_rbf_smooth=2.0,
+    hf_median_radius_mm=3.0,
+    hf_gaussian_sigma_px=2.0,
+    hf_close_size_px=3,
+    hf_mask_dilate_iters=1,
+    hf_mask_close_size=3,
+    hf_max_samples=20000,
 ):
     """
     处理目录中的所有点云文件
@@ -549,6 +774,16 @@ def process_directory(
             smooth_method,
             smooth_iterations,
             decimate_target_triangles,
+            hf_grid_res_mm,
+            hf_method,
+            hf_rbf_function,
+            hf_rbf_smooth,
+            hf_median_radius_mm,
+            hf_gaussian_sigma_px,
+            hf_close_size_px,
+            hf_mask_dilate_iters,
+            hf_mask_close_size,
+            hf_max_samples,
         ):
             success_count += 1
     
@@ -561,7 +796,7 @@ def main():
                        help='输入点云文件路径或目录 (默认: output/pointcloud/insoles)')
     parser.add_argument('output', nargs='?', default='output/raw/insoles',
                        help='输出STL文件路径或目录 (默认: output/raw/insoles)')
-    parser.add_argument('--method', choices=['poisson', 'ball_pivoting', 'alpha_shape'], 
+    parser.add_argument('--method', choices=['poisson', 'ball_pivoting', 'alpha_shape', 'height_field'], 
                        default='poisson', help='重建方法 (默认: poisson)')
     parser.add_argument('--depth', type=int, default=10, 
                        help='泊松重建的八叉树深度 (建议: 8-10; 默认: 10)')
@@ -593,6 +828,18 @@ def main():
     parser.add_argument('--smooth-method', choices=['none', 'simple', 'laplacian', 'taubin'], default='taubin', help='网格平滑方法')
     parser.add_argument('--smooth-iterations', type=int, default=50, help='平滑迭代次数 (默认: 50)')
     parser.add_argument('--decimate-target-triangles', type=int, default=0, help='网格简化目标三角形数（<=0 禁用）')
+
+    # Height-field options
+    parser.add_argument('--hf-grid-res-mm', type=float, default=1.5, help='高度场网格分辨率（mm）')
+    parser.add_argument('--hf-method', choices=['rbf', 'median'], default='rbf', help='高度场拟合方法')
+    parser.add_argument('--hf-rbf-function', choices=['thin_plate', 'multiquadric', 'inverse', 'gaussian', 'linear', 'cubic', 'quintic'], default='thin_plate', help='RBF 基函数')
+    parser.add_argument('--hf-rbf-smooth', type=float, default=2.0, help='RBF 平滑系数')
+    parser.add_argument('--hf-median-radius-mm', type=float, default=3.0, help='中值半径（mm），用于 median 方法')
+    parser.add_argument('--hf-gaussian-sigma-px', type=float, default=2.0, help='高度图高斯平滑 sigma（像素）')
+    parser.add_argument('--hf-close-size-px', type=int, default=3, help='高度图灰度闭运算窗口（像素）')
+    parser.add_argument('--hf-mask-dilate-iters', type=int, default=1, help='轮廓膨胀迭代次数')
+    parser.add_argument('--hf-mask-close-size', type=int, default=3, help='轮廓闭运算窗口（像素）')
+    parser.add_argument('--hf-max-samples', type=int, default=20000, help='RBF 最大采样点数（加速）')
 
     args = parser.parse_args()
     
@@ -638,6 +885,16 @@ def main():
             args.smooth_method,
             args.smooth_iterations,
             args.decimate_target_triangles,
+            args.hf_grid_res_mm,
+            args.hf_method,
+            args.hf_rbf_function,
+            args.hf_rbf_smooth,
+            args.hf_median_radius_mm,
+            args.hf_gaussian_sigma_px,
+            args.hf_close_size_px,
+            args.hf_mask_dilate_iters,
+            args.hf_mask_close_size,
+            args.hf_max_samples,
         )
     
     elif os.path.isdir(args.input):
@@ -667,6 +924,16 @@ def main():
             smooth_method=args.smooth_method,
             smooth_iterations=args.smooth_iterations,
             decimate_target_triangles=args.decimate_target_triangles,
+            hf_grid_res_mm=args.hf_grid_res_mm,
+            hf_method=args.hf_method,
+            hf_rbf_function=args.hf_rbf_function,
+            hf_rbf_smooth=args.hf_rbf_smooth,
+            hf_median_radius_mm=args.hf_median_radius_mm,
+            hf_gaussian_sigma_px=args.hf_gaussian_sigma_px,
+            hf_close_size_px=args.hf_close_size_px,
+            hf_mask_dilate_iters=args.hf_mask_dilate_iters,
+            hf_mask_close_size=args.hf_mask_close_size,
+            hf_max_samples=args.hf_max_samples,
         )
     
     else:
